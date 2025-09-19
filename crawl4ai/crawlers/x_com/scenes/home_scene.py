@@ -1,53 +1,65 @@
 # crawl4ai/crawlers/x_com/scenes/home_scene.py
 
+import asyncio
 from playwright.async_api import Page, expect
 from .base_scene import BaseScene
 
 
 class HomeScene(BaseScene):
     """
-    A scene for scraping the main home timeline of the logged-in user.
+    A scene for scanning the home timeline and scraping the URLs of the tweets.
+    Its sole purpose is to quickly gather a list of tweet URLs for further processing.
     """
 
     async def scrape(self, page: Page, **kwargs) -> list:
         """
-        Scrapes the user's home timeline for recent tweets.
+        Scrapes the home timeline for tweet URLs.
 
         Args:
             page (Page): An authenticated Playwright Page object.
-            **kwargs: Not used in this scene, but included for compatibility.
+            **kwargs: See BaseScene for standard arguments.
 
         Returns:
-            list: A list of dictionaries representing the scraped tweets.
+            list: A list of unique tweet URL strings.
         """
-        print("--- Scraping Home Scene ---")
+        print("--- Scanning Home Scene for Tweet URLs ---")
         
-        # Navigate to the home page
+        scroll_count = kwargs.get("scroll_count", 5)
+        tweet_urls = set()
+
         await page.goto("https://x.com/home")
         print("Navigated to home timeline.")
 
-        # Wait for the primary column containing tweets to be visible
         primary_column = page.locator('[data-testid="primaryColumn"]')
         await expect(primary_column).to_be_visible(timeout=15000)
-        print("Primary column is visible.")
+        await expect(primary_column.locator('article[data-testid="tweet"]').first).to_be_visible(timeout=15000)
+        print("Initial tweets loaded.")
 
-        # Wait for at least one tweet to appear in the timeline
-        # This is a more reliable way to ensure content has loaded
-        await expect(primary_column.locator('article[data-testid="tweet"]')).to_have_count(1, timeout=15000)
-        print("Found at least one tweet.")
+        for i in range(scroll_count):
+            print(f"\n--- Scroll attempt {i + 1}/{scroll_count} ---")
+            
+            tweet_elements = await primary_column.locator('article[data-testid="tweet"]').all()
 
-        # Extract data from the tweets
-        # This is a placeholder for the actual data extraction logic
-        tweet_elements = await primary_column.locator('article[data-testid="tweet"]').all()
-        print(f"Found {len(tweet_elements)} tweets on the page.")
+            for tweet_element in tweet_elements:
+                try:
+                    # The most reliable way to get a tweet's URL is from its timestamp link.
+                    all_links = await tweet_element.locator('a[role="link"]').all()
+                    for link in all_links:
+                        if await link.locator("time").count() > 0:
+                            href = await link.get_attribute("href")
+                            if href and "/status/" in href:
+                                full_url = f"https://x.com{href}"
+                                if full_url not in tweet_urls:
+                                    tweet_urls.add(full_url)
+                                    print(f"[URL Found]: {full_url}")
+                                break # Move to the next tweet element
 
-        scraped_data = []
-        for tweet_element in tweet_elements:
-            try:
-                tweet_text = await tweet_element.locator('[data-testid="tweetText"]').inner_text()
-                scraped_data.append({"text": tweet_text})
-            except Exception as e:
-                print(f"Could not extract text from a tweet: {e}")
+                except Exception as e:
+                    print(f"Could not extract URL from a tweet element: {e}")
 
-        print(f"--- Finished Scraping Home Scene: {len(scraped_data)} items scraped ---")
-        return scraped_data
+            print("Scrolling down...")
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(2)
+
+        print(f"\n--- Finished Scanning Home Scene: {len(tweet_urls)} unique URLs found ---")
+        return list(tweet_urls)

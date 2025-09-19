@@ -1,0 +1,120 @@
+# crawl4ai/crawlers/x_com/scenes/tweet_detail_scene.py
+
+from playwright.async_api import Page, expect
+from .base_scene import BaseScene
+import asyncio
+import re
+
+class TweetDetailScene(BaseScene):
+    """
+    A reusable scene designed to scrape all details from a single tweet's detail page.
+    """
+
+    async def scrape(self, page: Page, **kwargs) -> dict:
+        """
+        Scrapes a single tweet's detail page for its full content and all key metrics.
+        """
+        tweet_url = kwargs.get("url")
+        if not tweet_url:
+            print("Error: TweetDetailScene requires a 'url' parameter.")
+            return {}
+
+        print(f"--- Scraping Tweet Detail Scene for URL: {tweet_url} ---")
+        
+        # --- FIX: Increased timeout to 60 seconds for better stability ---
+        await page.goto(tweet_url, timeout=60000)
+        
+        primary_column = page.locator('[data-testid="primaryColumn"]')
+        main_tweet_element = primary_column.locator('article[data-testid="tweet"]').first
+        await expect(main_tweet_element).to_be_visible(timeout=15000)
+        print("Main tweet element is visible.")
+
+        core_data = await self._extract_tweet_data(main_tweet_element)
+        metrics = await self._extract_all_metrics(main_tweet_element)
+
+        replies = []
+        if kwargs.get("include_replies", False):
+            replies = await self._scrape_replies(page, primary_column, **kwargs)
+
+        scraped_data = {
+            "url": tweet_url,
+            "author": core_data.get("author"),
+            "full_text": core_data.get("text"),
+            "reply_count": metrics.get("reply_count", "0"),
+            "repost_count": metrics.get("repost_count", "0"),
+            "like_count": metrics.get("like_count", "0"),
+            "bookmark_count": metrics.get("bookmark_count", "0"),
+            "view_count": metrics.get("view_count", "0"),
+            "scraped_replies_count": len(replies),
+            "replies": replies
+        }
+
+        print(f"--- Finished Scene. Author: {core_data.get('author')}, Replies: {metrics.get('reply_count')}, Reposts: {metrics.get('repost_count')}, Likes: {metrics.get('like_count')}, Views: {metrics.get('view_count')} ---")
+        return scraped_data
+
+    def _parse_metric(self, text: str, keyword: str):
+        """Extracts a number for a specific keyword from a combined text."""
+        # --- FIX: Use raw string (r"...") to avoid SyntaxWarning ---
+        match = re.search(rf"([\d,.]+[KkMm]?)\s+{keyword}", text)
+        return match.group(1) if match else "0"
+
+    async def _extract_all_metrics(self, tweet_element):
+        """The ultimate, robust metric extractor based on the combined aria-label."""
+        metrics = {}
+        try:
+            combined_label_element = tweet_element.locator('[aria-label*="replies"][aria-label*="reposts"][aria-label*="likes"]').first
+            label_text = await combined_label_element.get_attribute("aria-label")
+            
+            if label_text:
+                label_lower = label_text.lower()
+                metrics["reply_count"] = self._parse_metric(label_lower, "replies") or self._parse_metric(label_lower, "reply")
+                metrics["repost_count"] = self._parse_metric(label_lower, "reposts") or self._parse_metric(label_lower, "repost")
+                metrics["like_count"] = self._parse_metric(label_lower, "likes") or self._parse_metric(label_lower, "like")
+                metrics["bookmark_count"] = self._parse_metric(label_lower, "bookmarks") or self._parse_metric(label_lower, "bookmark")
+                metrics["view_count"] = self._parse_metric(label_lower, "views") or self._parse_metric(label_lower, "view")
+        except Exception as e:
+            print(f"Error extracting combined metrics: {e}")
+        return metrics
+
+    async def _extract_tweet_data(self, tweet_element):
+        author = ""
+        text = ""
+        try:
+            author_element = tweet_element.locator('[data-testid="User-Name"]').first
+            author = await author_element.locator("span").first.inner_text()
+        except Exception: pass
+        try:
+            text_element = tweet_element.locator('[data-testid="tweetText"]')
+            text = await text_element.inner_text()
+        except Exception: pass
+        return {"author": author, "text": text}
+
+    async def _scrape_replies(self, page, primary_column, **kwargs):
+        max_replies = kwargs.get("max_replies")
+        reply_scroll_count = kwargs.get("reply_scroll_count", 5)
+        
+        replies = []
+        scraped_reply_identifiers = set()
+
+        for i in range(reply_scroll_count):
+            all_tweet_elements = await primary_column.locator('article[data-testid="tweet"]').all()
+            reply_elements = all_tweet_elements[1:]
+
+            for reply_element in reply_elements:
+                reply_data = await self._extract_tweet_data(reply_element)
+                identifier = f"{reply_data['author']}-{reply_data['text']}"
+
+                if reply_data["text"] and identifier not in scraped_reply_identifiers:
+                    scraped_reply_identifiers.add(identifier)
+                    replies.append(reply_data)
+                    
+                    if max_replies is not None and len(replies) >= max_replies:
+                        break
+            
+            if max_replies is not None and len(replies) >= max_replies:
+                break
+
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(2)
+            
+        return replies

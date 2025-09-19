@@ -1,14 +1,14 @@
 # crawl4ai/crawlers/x_com/production_crawler.py
 
+import asyncio
 import importlib
 from pathlib import Path
-from playwright.async_api import Page
+from playwright.async_api import Page, async_playwright, expect
+import os
+from dotenv import load_dotenv
 
-# In production, we will rely on the project's shared modules.
-# These imports assume the crawler is integrated into the main application.
-# from crawl4ai.browser_manager import BrowserManager
-# from crawl4ai.config import Config
-# from crawl4ai.async_logger import logger
+# Import the new output handler
+from .output_handler import save_output
 
 # For now, we will use placeholders until full integration.
 class_logger = type("Logger", (), {"info": print, "warning": print, "error": print})
@@ -22,20 +22,9 @@ AUTH_STATE_PATH = Path(__file__).parent / "auth_state.json"
 class XProductionCrawler:
     """
     A production-ready crawler for X.com.
-
-    This crawler coordinates scraping tasks by dispatching them to specific "scene"
-    modules. It is designed to be integrated into the main crawl4ai application
-    and relies on the application's shared BrowserManager and Config objects.
     """
 
     def __init__(self, config, browser_manager):
-        """
-        Initializes the XProductionCrawler.
-
-        Args:
-            config (Config): The application's configuration object.
-            browser_manager (BrowserManager): The manager for browser instances.
-        """
         self.config = config
         self.browser_manager = browser_manager
         self.username = self.config.get("X_USERNAME")
@@ -43,18 +32,11 @@ class XProductionCrawler:
         logger.info("XProductionCrawler initialized.")
 
     async def login(self):
-        """
-        Performs login to X.com and saves the session state.
-
-        This method should be run manually via a separate script or CLI command
-        as it may require manual intervention (e.g., for CAPTCHAs).
-        """
         if not self.username or not self.password:
             logger.error("Cannot login: X_USERNAME or X_PASSWORD is not configured.")
             return
 
         logger.info("Attempting to log in to X.com...")
-        # For login, we specifically need a headed instance.
         page = await self.browser_manager.new_page(headless=False)
         if not page:
             logger.error("Failed to get a new page from BrowserManager for login.")
@@ -64,41 +46,33 @@ class XProductionCrawler:
             await page.goto("https://x.com/login")
             await page.locator('input[name="text"]').fill(self.username)
             await page.get_by_role("button", name="Next").click()
-            
             try:
                 username_input_again = page.locator('input[data-testid="ocfEnterTextTextInput"]')
                 await username_input_again.wait_for(timeout=5000)
                 if await username_input_again.is_visible():
-                    logger.info("Handling unusual login prompt...")
                     await username_input_again.fill(self.username)
                     await page.get_by_role("button", name="Next").click()
             except: pass
-
             await page.locator('input[name="password"]').fill(self.password)
             await page.get_by_role("button", name="Log in").click()
-            
-            await page.locator('[data-testid="primaryColumn"]').wait_for(timeout=30000)
-            
+            await expect(page.locator('[data-testid="primaryColumn"]')).to_be_visible(timeout=30000)
             await page.context.storage_state(path=AUTH_STATE_PATH)
             logger.info(f"Login successful! Auth state saved to {AUTH_STATE_PATH}")
-
         except Exception as e:
             logger.error(f"An error occurred during login: {e}")
         finally:
-            await page.close()
+            await page.context.close()
 
     async def scrape(self, scene: str, **kwargs) -> list:
-        """
-        Performs scraping for a given scene (e.g., 'home', 'explore', 'search').
-        """
         if not AUTH_STATE_PATH.exists():
             logger.error(f"Authentication file not found at {AUTH_STATE_PATH}.")
             return []
 
         try:
-            scene_module_name = f".scenes.{scene.lower()}_scene"
-            scene_module = importlib.import_module(scene_module_name, package=__package__)
-            SceneClass = getattr(scene_module, f"{scene.capitalize()}Scene")
+            scene_module_name = f"crawl4ai.crawlers.x_com.scenes.{scene.lower()}_scene"
+            scene_module = importlib.import_module(scene_module_name)
+            scene_class_name = "".join(word.capitalize() for word in scene.split('_')) + "Scene"
+            SceneClass = getattr(scene_module, scene_class_name)
             scene_instance = SceneClass()
         except (ImportError, AttributeError) as e:
             logger.error(f"Scene '{scene}' not found or module is malformed: {e}")
@@ -115,4 +89,71 @@ class XProductionCrawler:
             logger.error(f"An error occurred during scraping scene '{scene}': {e}")
             return []
         finally:
-            await page.close()
+            await page.context.close()
+
+
+# --- Test Harness for Standalone Execution ---
+
+class MockConfig:
+    def __init__(self):
+        load_dotenv()
+    def get(self, key):
+        return os.getenv(key)
+
+class MockBrowserManager:
+    async def __aenter__(self):
+        self.playwright = await async_playwright().start()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.playwright.stop()
+
+    async def new_page(self, headless=True, storage_state=None):
+        browser = await self.playwright.chromium.launch(headless=headless)
+        context = await browser.new_context(storage_state=storage_state)
+        page = await context.new_page()
+        original_close = page.close
+        page.close = lambda: asyncio.gather(original_close(), context.close())
+        return page
+
+async def main():
+    """
+    Main function demonstrating the "Scan -> Detail -> Output" workflow.
+    """
+    print("--- Running XProductionCrawler in Standalone Test Mode ---")
+    
+    mock_config = MockConfig()
+    async with MockBrowserManager() as mock_browser_manager:
+        crawler = XProductionCrawler(config=mock_config, browser_manager=mock_browser_manager)
+
+        # await crawler.login()
+
+        if AUTH_STATE_PATH.exists():
+            # Define the search keyword
+            search_keyword = "OpenAI"
+
+            # --- STAGE 1: SCAN ---
+            print(f"\n--- STAGE 1: Scanning for URLs with keyword: '{search_keyword}' ---")
+            tweet_urls = await crawler.scrape("search", query=search_keyword, scroll_count=1)
+
+            # --- STAGE 2: DETAIL ---
+            print(f"\n--- STAGE 2: Fetching details for {len(tweet_urls)} URLs ---")
+            all_tweet_details = []
+            for url in tweet_urls:
+                detailed_data = await crawler.scrape(
+                    "tweet_detail",
+                    url=url,
+                    include_replies=True,
+                    max_replies=3
+                )
+                if detailed_data:
+                    all_tweet_details.append(detailed_data)
+            
+            # --- STAGE 3: OUTPUT ---
+            await save_output(data=all_tweet_details, keyword=search_keyword)
+
+        else:
+            print("\nAuth file not found. Please run the login task first.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
