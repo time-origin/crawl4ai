@@ -8,16 +8,16 @@ from datetime import datetime
 # Define the output directory relative to this file's location
 OUTPUT_DIR = Path(__file__).parent / "out" / "scraped"
 
-async def save_output(data: list, keyword: str):
+async def save_output(data: list, keyword: str, prefix: str):
     """
     A flexible output handler for scraped data.
 
-    Saves data to a timestamped JSON file with a fixed prefix,
-    and formats the output to include the search keyword.
+    Saves data to a timestamped JSON file using a specified prefix.
 
     Args:
         data (list): The list of scraped data dictionaries to save.
-        keyword (str): The search keyword used for this scrape (used in JSON content).
+        keyword (str): The search keyword used for this scrape.
+        prefix (str): The prefix for the output filename.
     """
     if not data:
         print("No data to save.")
@@ -26,12 +26,12 @@ async def save_output(data: list, keyword: str):
     # Ensure the output directory exists
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     
-    # --- FIX: Generate a filename with a fixed prefix as requested ---
+    # Generate a timestamped filename using the provided prefix
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"x_com_scrape_{timestamp}.json"
+    filename = f"{prefix}_{timestamp}.json"
     file_path = OUTPUT_DIR / filename
 
-    # The JSON object structure remains the same, including the keyword.
+    # Structure the final JSON object as requested
     output_object = {
         "keyword": keyword,
         "result": data

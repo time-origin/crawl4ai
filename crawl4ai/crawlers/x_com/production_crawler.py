@@ -6,24 +6,17 @@ from pathlib import Path
 from playwright.async_api import Page, async_playwright, expect
 import os
 from dotenv import load_dotenv
+import argparse
+import re
 
-# Import the new output handler
 from .output_handler import save_output
 
-# For now, we will use placeholders until full integration.
 class_logger = type("Logger", (), {"info": print, "warning": print, "error": print})
 logger = class_logger()
 
-
-# Define a path for storing the authentication state, relative to this file
 AUTH_STATE_PATH = Path(__file__).parent / "auth_state.json"
 
-
 class XProductionCrawler:
-    """
-    A production-ready crawler for X.com.
-    """
-
     def __init__(self, config, browser_manager):
         self.config = config
         self.browser_manager = browser_manager
@@ -35,15 +28,11 @@ class XProductionCrawler:
         if not self.username or not self.password:
             logger.error("Cannot login: X_USERNAME or X_PASSWORD is not configured.")
             return
-
         logger.info("Attempting to log in to X.com...")
         page = await self.browser_manager.new_page(headless=False)
-        if not page:
-            logger.error("Failed to get a new page from BrowserManager for login.")
-            return
-
+        if not page: return
         try:
-            await page.goto("https://x.com/login")
+            await page.goto("https://x.com/login", wait_until="domcontentloaded")
             await page.locator('input[name="text"]').fill(self.username)
             await page.get_by_role("button", name="Next").click()
             try:
@@ -67,7 +56,6 @@ class XProductionCrawler:
         if not AUTH_STATE_PATH.exists():
             logger.error(f"Authentication file not found at {AUTH_STATE_PATH}.")
             return []
-
         try:
             scene_module_name = f"crawl4ai.crawlers.x_com.scenes.{scene.lower()}_scene"
             scene_module = importlib.import_module(scene_module_name)
@@ -77,12 +65,8 @@ class XProductionCrawler:
         except (ImportError, AttributeError) as e:
             logger.error(f"Scene '{scene}' not found or module is malformed: {e}")
             return []
-
         page = await self.browser_manager.new_page(storage_state=str(AUTH_STATE_PATH))
-        if not page:
-            logger.error("Failed to get a new page from BrowserManager for scraping.")
-            return []
-
+        if not page: return []
         try:
             return await scene_instance.scrape(page, **kwargs)
         except Exception as e:
@@ -90,9 +74,6 @@ class XProductionCrawler:
             return []
         finally:
             await page.context.close()
-
-
-# --- Test Harness for Standalone Execution ---
 
 class MockConfig:
     def __init__(self):
@@ -104,10 +85,8 @@ class MockBrowserManager:
     async def __aenter__(self):
         self.playwright = await async_playwright().start()
         return self
-
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.playwright.stop()
-
     async def new_page(self, headless=True, storage_state=None):
         browser = await self.playwright.chromium.launch(headless=headless)
         context = await browser.new_context(storage_state=storage_state)
@@ -116,44 +95,46 @@ class MockBrowserManager:
         page.close = lambda: asyncio.gather(original_close(), context.close())
         return page
 
-async def main():
-    """
-    Main function demonstrating the "Scan -> Detail -> Output" workflow.
-    """
+async def main(args):
     print("--- Running XProductionCrawler in Standalone Test Mode ---")
-    
     mock_config = MockConfig()
     async with MockBrowserManager() as mock_browser_manager:
         crawler = XProductionCrawler(config=mock_config, browser_manager=mock_browser_manager)
-
-        # await crawler.login()
-
-        if AUTH_STATE_PATH.exists():
-            # Define the search keyword
-            search_keyword = "OpenAI"
-
-            # --- STAGE 1: SCAN ---
-            print(f"\n--- STAGE 1: Scanning for URLs with keyword: '{search_keyword}' ---")
-            tweet_urls = await crawler.scrape("search", query=search_keyword, scroll_count=1)
-
-            # --- STAGE 2: DETAIL ---
-            print(f"\n--- STAGE 2: Fetching details for {len(tweet_urls)} URLs ---")
-            all_tweet_details = []
-            for url in tweet_urls:
-                detailed_data = await crawler.scrape(
-                    "tweet_detail",
-                    url=url,
-                    include_replies=True,
-                    max_replies=3
-                )
-                if detailed_data:
-                    all_tweet_details.append(detailed_data)
-            
-            # --- STAGE 3: OUTPUT ---
-            await save_output(data=all_tweet_details, keyword=search_keyword)
-
-        else:
-            print("\nAuth file not found. Please run the login task first.")
+        if args.login:
+            await crawler.login()
+            return
+        if not AUTH_STATE_PATH.exists():
+            print("\nAuth file not found. Please run with --login first.")
+            return
+        print(f"\n--- STAGE 1: Scanning for URLs with keyword: '{args.keyword}' ---")
+        tweet_urls = await crawler.scrape("search", query=args.keyword, scroll_count=args.scan_scrolls)
+        print(f"\n--- STAGE 2: Fetching details for {len(tweet_urls)} URLs ---")
+        all_tweet_details = []
+        for url in tweet_urls:
+            detailed_data = await crawler.scrape(
+                "tweet_detail",
+                url=url,
+                include_replies=args.fetch_replies,
+                max_replies=args.max_replies,
+                reply_scroll_count=args.reply_scrolls
+            )
+            if detailed_data:
+                all_tweet_details.append(detailed_data)
+        await save_output(data=all_tweet_details, keyword=args.keyword, prefix=args.output_prefix)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description="Scrape X.com for tweets.")
+    login_group = parser.add_argument_group('Authentication')
+    login_group.add_argument("--login", action="store_true", help="Perform the login process and save the session.")
+    scrape_group = parser.add_argument_group('Scraping Options')
+    scrape_group.add_argument("--keyword", type=str, help="The search keyword to use (required for scraping).")
+    scrape_group.add_argument("--scan-scrolls", type=int, default=1, help="Number of scrolls during the initial URL scan (default: 1).")
+    scrape_group.add_argument("--fetch-replies", action="store_true", help="A switch to enable reply scraping.")
+    scrape_group.add_argument("--max-replies", type=int, default=3, help="The maximum number of replies to fetch per tweet (default: 3).")
+    scrape_group.add_argument("--reply-scrolls", type=int, default=5, help="The maximum number of scrolls to find replies (default: 5).")
+    output_group = parser.add_argument_group('Output Options')
+    output_group.add_argument("--output-prefix", type=str, default="x_com_scrape", help="Prefix for the output JSON file (default: x_com_scrape).")
+    parsed_args = parser.parse_args()
+    if not parsed_args.login and not parsed_args.keyword:
+        parser.error("the --keyword argument is required when not performing --login.")
+    asyncio.run(main(parsed_args))
