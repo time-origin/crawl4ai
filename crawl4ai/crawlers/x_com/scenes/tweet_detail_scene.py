@@ -21,8 +21,7 @@ class TweetDetailScene(BaseScene):
 
         print(f"--- Scraping Tweet Detail Scene for URL: {tweet_url} ---")
         
-        # --- FIX: Increased timeout to 60 seconds for better stability ---
-        await page.goto(tweet_url, timeout=60000)
+        await page.goto(tweet_url, wait_until="domcontentloaded", timeout=60000)
         
         primary_column = page.locator('[data-testid="primaryColumn"]')
         main_tweet_element = primary_column.locator('article[data-testid="tweet"]').first
@@ -52,28 +51,43 @@ class TweetDetailScene(BaseScene):
         print(f"--- Finished Scene. Author: {core_data.get('author')}, Replies: {metrics.get('reply_count')}, Reposts: {metrics.get('repost_count')}, Likes: {metrics.get('like_count')}, Views: {metrics.get('view_count')} ---")
         return scraped_data
 
-    def _parse_metric(self, text: str, keyword: str):
-        """Extracts a number for a specific keyword from a combined text."""
-        # --- FIX: Use raw string (r"...") to avoid SyntaxWarning ---
-        match = re.search(rf"([\d,.]+[KkMm]?)\s+{keyword}", text)
-        return match.group(1) if match else "0"
-
     async def _extract_all_metrics(self, tweet_element):
-        """The ultimate, robust metric extractor based on the combined aria-label."""
+        """The ultimate, robust metric extractor. Uses independent IFs and precise regex."""
         metrics = {}
         try:
-            combined_label_element = tweet_element.locator('[aria-label*="replies"][aria-label*="reposts"][aria-label*="likes"]').first
-            label_text = await combined_label_element.get_attribute("aria-label")
+            metric_candidates = await tweet_element.locator('[aria-label]').all()
             
-            if label_text:
-                label_lower = label_text.lower()
-                metrics["reply_count"] = self._parse_metric(label_lower, "replies") or self._parse_metric(label_lower, "reply")
-                metrics["repost_count"] = self._parse_metric(label_lower, "reposts") or self._parse_metric(label_lower, "repost")
-                metrics["like_count"] = self._parse_metric(label_lower, "likes") or self._parse_metric(label_lower, "like")
-                metrics["bookmark_count"] = self._parse_metric(label_lower, "bookmarks") or self._parse_metric(label_lower, "bookmark")
-                metrics["view_count"] = self._parse_metric(label_lower, "views") or self._parse_metric(label_lower, "view")
+            for candidate in metric_candidates:
+                label = await candidate.get_attribute("aria-label")
+                if not label: continue
+                label_lower = label.lower()
+
+                # --- THE FINAL FIX --- 
+                # Use separate `if` statements for each metric to handle combined labels correctly.
+                # Use a precise regex for each to extract the number associated with a keyword.
+
+                if "reply_count" not in metrics:
+                    match = re.search(r"([\d,.]+[KkMm]?)\s+(replies|reply)", label_lower)
+                    if match: metrics["reply_count"] = match.group(1)
+
+                if "repost_count" not in metrics:
+                    match = re.search(r"([\d,.]+[KkMm]?)\s+(reposts|retweet)", label_lower)
+                    if match: metrics["repost_count"] = match.group(1)
+
+                if "like_count" not in metrics:
+                    match = re.search(r"([\d,.]+[KkMm]?)\s+(likes|like)", label_lower)
+                    if match: metrics["like_count"] = match.group(1)
+
+                if "bookmark_count" not in metrics:
+                    match = re.search(r"([\d,.]+[KkMm]?)\s+(bookmarks|bookmark)", label_lower)
+                    if match: metrics["bookmark_count"] = match.group(1)
+
+                if "view_count" not in metrics:
+                    match = re.search(r"([\d,.]+[KkMm]?)\s+(views|view)", label_lower)
+                    if match: metrics["view_count"] = match.group(1)
+
         except Exception as e:
-            print(f"Error extracting combined metrics: {e}")
+            print(f"Error extracting metrics: {e}")
         return metrics
 
     async def _extract_tweet_data(self, tweet_element):
