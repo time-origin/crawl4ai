@@ -8,8 +8,10 @@ import os
 from dotenv import load_dotenv
 import argparse
 import re
+import inspect
+from datetime import datetime
 
-from .output_handler import save_output
+from .output_handler import save_batch_to_file, send_to_kafka
 
 class_logger = type("Logger", (), {"info": print, "warning": print, "error": print})
 logger = class_logger()
@@ -52,10 +54,11 @@ class XProductionCrawler:
         finally:
             await page.context.close()
 
-    async def scrape(self, scene: str, **kwargs) -> list:
+    async def scrape(self, scene: str, **kwargs):
         if not AUTH_STATE_PATH.exists():
             logger.error(f"Authentication file not found at {AUTH_STATE_PATH}.")
-            return []
+            async def empty_generator(): yield
+            return empty_generator() if scene in ["search", "home"] else {}
         try:
             scene_module_name = f"crawl4ai.crawlers.x_com.scenes.{scene.lower()}_scene"
             scene_module = importlib.import_module(scene_module_name)
@@ -64,16 +67,29 @@ class XProductionCrawler:
             scene_instance = SceneClass()
         except (ImportError, AttributeError) as e:
             logger.error(f"Scene '{scene}' not found or module is malformed: {e}")
-            return []
+            async def empty_generator(): yield
+            return empty_generator() if scene in ["search", "home"] else {}
+        
         page = await self.browser_manager.new_page(storage_state=str(AUTH_STATE_PATH))
-        if not page: return []
-        try:
-            return await scene_instance.scrape(page, **kwargs)
-        except Exception as e:
-            logger.error(f"An error occurred during scraping scene '{scene}': {e}")
-            return []
-        finally:
-            await page.context.close()
+        if not page:
+            async def empty_generator(): yield
+            return empty_generator() if scene in ["search", "home"] else {}
+
+        result = scene_instance.scrape(page, **kwargs)
+
+        if inspect.isasyncgen(result):
+            async def page_managing_generator():
+                try:
+                    async for item in result:
+                        yield item
+                finally:
+                    await page.context.close()
+            return page_managing_generator()
+        else:
+            try:
+                return await result
+            finally:
+                await page.context.close()
 
 class MockConfig:
     def __init__(self):
@@ -96,45 +112,81 @@ class MockBrowserManager:
         return page
 
 async def main(args):
-    print("--- Running XProductionCrawler in Standalone Test Mode ---")
+    """
+    Main function implementing the real-time, batch-processing workflow.
+    """
+    print("--- Running XProductionCrawler in Streaming Mode ---")
+    
     mock_config = MockConfig()
     async with MockBrowserManager() as mock_browser_manager:
         crawler = XProductionCrawler(config=mock_config, browser_manager=mock_browser_manager)
+
         if args.login:
             await crawler.login()
             return
+
         if not AUTH_STATE_PATH.exists():
             print("\nAuth file not found. Please run with --login first.")
             return
-        print(f"\n--- STAGE 1: Scanning for URLs with keyword: '{args.keyword}' ---")
-        tweet_urls = await crawler.scrape("search", query=args.keyword, scroll_count=args.scan_scrolls)
-        print(f"\n--- STAGE 2: Fetching details for {len(tweet_urls)} URLs ---")
-        all_tweet_details = []
-        for url in tweet_urls:
-            detailed_data = await crawler.scrape(
-                "tweet_detail",
-                url=url,
-                include_replies=args.fetch_replies,
-                max_replies=args.max_replies,
-                reply_scroll_count=args.reply_scrolls
-            )
-            if detailed_data:
-                all_tweet_details.append(detailed_data)
-        await save_output(data=all_tweet_details, keyword=args.keyword, prefix=args.output_prefix)
+
+        should_fetch_replies = args.max_replies is not None and args.max_replies > 0
+        run_folder = None
+        if args.output_method == 'file':
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_folder = Path(__file__).parent / "out" / "scraped" / f"{args.output_prefix}_{timestamp}"
+            run_folder.mkdir(parents=True, exist_ok=True)
+            print(f"File output enabled. Saving results to: {run_folder}")
+
+        batch_num = 0
+        # --- FINAL FIX for TypeError: AWAIT the call to get the generator ---
+        scanner = await crawler.scrape("search", query=args.keyword, scroll_count=args.scan_scrolls)
+        
+        async for url_batch in scanner:
+            batch_num += 1
+            print(f"\n--- PROCESSING BATCH {batch_num} ({len(url_batch)} URLs) ---")
+
+            batch_details = []
+            for url in url_batch:
+                detailed_data = await crawler.scrape(
+                    "tweet_detail",
+                    url=url,
+                    include_replies=should_fetch_replies,
+                    max_replies=args.max_replies,
+                    reply_scroll_count=args.reply_scrolls
+                )
+                if detailed_data:
+                    batch_details.append(detailed_data)
+            
+            if not batch_details:
+                print("No details scraped in this batch.")
+                continue
+
+            # --- REAL-TIME BATCH OUTPUT ---
+            if args.output_method == 'kafka':
+                await send_to_kafka(data=batch_details, keyword=args.keyword, batch_num=batch_num)
+            else:
+                await save_batch_to_file(data=batch_details, keyword=args.keyword, run_folder=run_folder, batch_num=batch_num)
+        
+        print("\n--- Streaming Workflow Complete ---")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Scrape X.com for tweets.")
+    parser = argparse.ArgumentParser(description="Scrape X.com for tweets in real-time.")
+    
     login_group = parser.add_argument_group('Authentication')
-    login_group.add_argument("--login", action="store_true", help="Perform the login process and save the session.")
+    login_group.add_argument("--login", action="store_true", help="Perform the login process.")
+
     scrape_group = parser.add_argument_group('Scraping Options')
-    scrape_group.add_argument("--keyword", type=str, help="The search keyword to use (required for scraping).")
-    scrape_group.add_argument("--scan-scrolls", type=int, default=1, help="Number of scrolls during the initial URL scan (default: 1).")
-    scrape_group.add_argument("--fetch-replies", action="store_true", help="A switch to enable reply scraping.")
-    scrape_group.add_argument("--max-replies", type=int, default=3, help="The maximum number of replies to fetch per tweet (default: 3).")
-    scrape_group.add_argument("--reply-scrolls", type=int, default=5, help="The maximum number of scrolls to find replies (default: 5).")
+    scrape_group.add_argument("--keyword", type=str, help="The search keyword to use.")
+    scrape_group.add_argument("--scan-scrolls", type=int, default=2, help="Number of scrolls during URL scan.")
+    scrape_group.add_argument("--max-replies", type=int, default=0, help="Max replies to fetch per tweet. Set to > 0 to enable reply scraping.")
+    scrape_group.add_argument("--reply-scrolls", type=int, default=5, help="Max scrolls to find replies.")
+
     output_group = parser.add_argument_group('Output Options')
-    output_group.add_argument("--output-prefix", type=str, default="x_com_scrape", help="Prefix for the output JSON file (default: x_com_scrape).")
+    output_group.add_argument("--output-method", type=str, choices=['file', 'kafka'], default='file', help="Choose output method.")
+    output_group.add_argument("--output-prefix", type=str, default="x_com_scrape", help="Prefix for the run folder.")
+    
     parsed_args = parser.parse_args()
     if not parsed_args.login and not parsed_args.keyword:
         parser.error("the --keyword argument is required when not performing --login.")
+
     asyncio.run(main(parsed_args))

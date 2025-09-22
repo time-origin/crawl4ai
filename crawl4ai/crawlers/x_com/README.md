@@ -1,7 +1,6 @@
 命令行参数：
 * --keyword (必需): 您要搜索的关键词。
 * --scan-scrolls (可选): 在搜索结果页滚动的次数，默认为 1。
-* --fetch-replies (可选): 一个开关，一旦使用，就代表您想要抓取回复。
 * --max-replies (可选): 每个推文最多抓取多少条回复，默认为 3。
 * --reply-scrolls (可选): 为了抓取回复，最多滚动多少次页面，默认为 5。
 * --output-prefix (可选): 输出的 JSON 文件名前缀，默认为 x_com_scrape。

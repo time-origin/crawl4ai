@@ -21,7 +21,7 @@ class TweetDetailScene(BaseScene):
 
         print(f"--- Scraping Tweet Detail Scene for URL: {tweet_url} ---")
         
-        await page.goto(tweet_url, wait_until="domcontentloaded", timeout=60000)
+        await page.goto(tweet_url, wait_until="domcontentloaded")
         
         primary_column = page.locator('[data-testid="primaryColumn"]')
         main_tweet_element = primary_column.locator('article[data-testid="tweet"]').first
@@ -52,7 +52,7 @@ class TweetDetailScene(BaseScene):
         return scraped_data
 
     async def _extract_all_metrics(self, tweet_element):
-        """The ultimate, robust metric extractor. Uses independent IFs and precise regex."""
+        """The ultimate, robust metric extractor. Searches the entire tweet element for aria-labels."""
         metrics = {}
         try:
             metric_candidates = await tweet_element.locator('[aria-label]').all()
@@ -60,32 +60,25 @@ class TweetDetailScene(BaseScene):
             for candidate in metric_candidates:
                 label = await candidate.get_attribute("aria-label")
                 if not label: continue
+
+                # Use a non-optional regex to find the number part.
+                match = re.search(r"[\d,.]+[KkMm]?", label)
+                if not match:
+                    continue
+                count = match.group(0)
+
                 label_lower = label.lower()
-
-                # --- THE FINAL FIX --- 
-                # Use separate `if` statements for each metric to handle combined labels correctly.
-                # Use a precise regex for each to extract the number associated with a keyword.
-
-                if "reply_count" not in metrics:
-                    match = re.search(r"([\d,.]+[KkMm]?)\s+(replies|reply)", label_lower)
-                    if match: metrics["reply_count"] = match.group(1)
-
-                if "repost_count" not in metrics:
-                    match = re.search(r"([\d,.]+[KkMm]?)\s+(reposts|retweet)", label_lower)
-                    if match: metrics["repost_count"] = match.group(1)
-
-                if "like_count" not in metrics:
-                    match = re.search(r"([\d,.]+[KkMm]?)\s+(likes|like)", label_lower)
-                    if match: metrics["like_count"] = match.group(1)
-
-                if "bookmark_count" not in metrics:
-                    match = re.search(r"([\d,.]+[KkMm]?)\s+(bookmarks|bookmark)", label_lower)
-                    if match: metrics["bookmark_count"] = match.group(1)
-
-                if "view_count" not in metrics:
-                    match = re.search(r"([\d,.]+[KkMm]?)\s+(views|view)", label_lower)
-                    if match: metrics["view_count"] = match.group(1)
-
+                # --- THE FINAL FIX: Use independent `if` statements instead of `elif` ---
+                if "repl" in label_lower:
+                    metrics["reply_count"] = count
+                if "repost" in label_lower or "retweet" in label_lower:
+                    metrics["repost_count"] = count
+                if "like" in label_lower:
+                    metrics["like_count"] = count
+                if "bookmark" in label_lower:
+                    metrics["bookmark_count"] = count
+                if "view" in label_lower:
+                    metrics["view_count"] = count
         except Exception as e:
             print(f"Error extracting metrics: {e}")
         return metrics
