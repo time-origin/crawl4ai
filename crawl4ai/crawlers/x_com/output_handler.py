@@ -4,56 +4,56 @@ import json
 from pathlib import Path
 import aiofiles
 from datetime import datetime
+import asyncio
 import os
+
 from aiokafka import AIOKafkaProducer
 
-async def save_batch_to_file(data: list, keyword: str, run_dir: Path, batch_num: int):
+async def save_batch_to_file(data: list, keyword: str, file_path: Path):
     """
-    Saves a single batch of data to its own numbered JSON file inside a run-specific directory.
+    Saves a single batch of data to a specific file path.
+
+    Args:
+        data (list): The list of scraped data dictionaries for this batch.
+        keyword (str): The search keyword associated with this data.
+        file_path (Path): The absolute path to the output file for this batch.
     """
     if not data:
-        print(f"Batch {batch_num}: No data to save.")
+        print("No data to save for this batch.")
         return
 
-    # The run directory is created by the main process
-    filename = f"batch_{batch_num}.json"
-    file_path = run_dir / filename
+    # The parent directory is now created by the main function.
+    print(f"\n--- Saving batch of {len(data)} items to {file_path} ---")
 
     output_object = {
         "keyword": keyword,
-        "batch_number": batch_num,
-        "item_count": len(data),
         "result": data
     }
 
-    print(f"--- Saving batch {batch_num} ({len(data)} items) to {file_path} ---")
     try:
         async with aiofiles.open(file_path, mode='w', encoding='utf-8') as f:
             await f.write(json.dumps(output_object, indent=4, ensure_ascii=False))
-        print(f"Successfully saved batch {batch_num}.")
+        print(f"Successfully saved batch to {file_path}")
     except Exception as e:
-        print(f"Error saving batch {batch_num} to file: {e}")
+        print(f"Error saving batch to file: {e}")
 
-async def send_batch_to_kafka(data: list, keyword: str, producer: AIOKafkaProducer, topic: str, batch_num: int):
+async def send_to_kafka(producer: AIOKafkaProducer, topic: str, data: list, keyword: str):
     """
-    Sends a batch of scraped data to a Kafka topic, one message per item.
+    Sends a batch of scraped data to a Kafka topic, with one message per item.
     """
     if not data:
-        print(f"Batch {batch_num}: No data to send to Kafka.")
+        print("No data to send to Kafka.")
         return
 
-    print(f"\n--- Sending batch {batch_num} ({len(data)} items) to Kafka topic '{topic}' ---")
-    try:
-        for item in data:
-            # Add the keyword to each individual item for context
-            message_object = {
-                "keyword": keyword,
-                "scraped_item": item
-            }
-            message = json.dumps(message_object, ensure_ascii=False).encode('utf-8')
-            await producer.send(topic, message)
-        # Wait for all messages in the batch to be sent
-        await producer.flush()
-        print(f"Successfully sent batch {batch_num} to Kafka.")
-    except Exception as e:
-        print(f"Error sending batch {batch_num} to Kafka: {e}")
+    print(f"\n--- Sending {len(data)} individual messages to Kafka topic '{topic}' ---")
+    tasks = []
+    for item in data:
+        message_object = {
+            "keyword": keyword,
+            "tweet_data": item
+        }
+        message = json.dumps(message_object, ensure_ascii=False).encode('utf-8')
+        tasks.append(producer.send(topic, message))
+    
+    await asyncio.gather(*tasks)
+    print(f"Successfully sent batch of {len(data)} messages to Kafka.")
