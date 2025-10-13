@@ -1,0 +1,45 @@
+# Dockerfile-custom: A lean, production-ready image for crawl4ai crawlers
+
+# 1. Base Image
+FROM python:3.12-slim-bookworm
+
+# 2. Environment Variables
+ENV PYTHONFAULTHANDLER=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# 3. Application Setup
+WORKDIR /app
+
+# 4. Python Dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 5. Application Code
+COPY . .
+RUN pip install --no-cache-dir .
+
+# 6. Playwright Setup (as root)
+RUN playwright install --with-deps
+
+# 7. Security & Permissions
+RUN useradd --create-home appuser
+
+# Copy browser cache from root to appuser
+RUN mkdir -p /home/appuser/.cache/ms-playwright && \
+    cp -r /root/.cache/ms-playwright/* /home/appuser/.cache/ms-playwright/ && \
+    chown -R appuser:appuser /home/appuser/.cache
+
+# Grant appuser ownership of the entire /app directory.
+RUN chown -R appuser:appuser /app
+
+# Grant appuser ownership of the python site-packages directory.
+RUN chown -R appuser:appuser /usr/local/lib/python3.12/site-packages/
+
+# Switch to the non-root user.
+USER appuser
+
+# 8. Default Command
+# No default CMD is set, allowing for flexible execution via `docker run`.

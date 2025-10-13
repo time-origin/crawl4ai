@@ -2,19 +2,28 @@
 
 import asyncio
 import importlib
-from pathlib import Path
-from playwright.async_api import Page, async_playwright, expect
+import sys
 import os
-from dotenv import load_dotenv
+from pathlib import Path
+from playwright.async_api import Page, async_playwright, expect, TimeoutError
 import argparse
 import re
 import inspect
 from datetime import datetime
 
-# As per your instructions, only this file is being modified.
-from .output_handler import save_batch_to_file
-from .kafka_manager import send_to_kafka, ensure_topic_exists
+from playwright_stealth import stealth_async
+
+# --- [FIX] Changed relative imports to absolute for PyInstaller compatibility ---
+from crawl4ai.crawlers.x_com import config
+from crawl4ai.crawlers.x_com.output_handler import save_batch_to_file
+from crawl4ai.crawlers.x_com.kafka_manager import send_to_kafka, ensure_topic_exists
 from aiokafka import AIOKafkaProducer
+
+# --- Logic for Bundled Execution ---
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    browsers_path = os.path.join(sys._MEIPASS, 'ms-playwright')
+    os.environ['PLAYWRIGHT_BROWSERS_PATH'] = browsers_path
+    print(f"Running in bundled mode. Setting Playwright browsers path to: {browsers_path}")
 
 class_logger = type("Logger", (), {"info": print, "warning": print, "error": print})
 logger = class_logger()
@@ -22,32 +31,66 @@ logger = class_logger()
 AUTH_STATE_PATH = Path(__file__).parent / "auth_state.json"
 
 class XProductionCrawler:
-    # This class is NOT being changed.
     def __init__(self, config, browser_manager):
         self.config = config
         self.browser_manager = browser_manager
-        self.username = self.config.get("X_USERNAME")
-        self.password = self.config.get("X_PASSWORD")
+        self.username = self.config.X_USERNAME
+        self.password = self.config.X_PASSWORD
 
     async def login(self):
-        if not self.username or not self.password: return
-        page = await self.browser_manager.new_page(headless=False)
+        if not self.username or not self.password:
+            print("Login credentials (X_USERNAME, X_PASSWORD) not found in environment variables.")
+            return
+        page = await self.browser_manager.new_page(headless=True)
         if not page: return
         try:
             await page.goto("https://x.com/login", wait_until="domcontentloaded")
-            await page.locator('input[name="text"]').fill(self.username)
-            await page.get_by_role("button", name="Next").click()
+            
             try:
-                username_input_again = page.locator('input[data-testid="ocfEnterTextTextInput"]')
-                await username_input_again.wait_for(timeout=5000)
-                if await username_input_again.is_visible():
-                    await username_input_again.fill(self.username)
-                    await page.get_by_role("button", name="Next").click()
-            except: pass
+                await page.locator('input[name="text"]').fill(self.username)
+            except TimeoutError as e:
+                print("\n---")
+                print("🛑 DEBUGGING: Timeout occurred while finding the username input field.")
+                page_html = await page.content()
+                print("\n--- PAGE HTML CONTENT START ---")
+                print(page_html)
+                print("--- PAGE HTML CONTENT END ---\n")
+                raise e
+
+            next_button = (
+                page.locator('[data-testid="ocfLoginNextLink"]')
+                .or_(page.get_by_role("button", name="Next", exact=True))
+                .or_(page.get_by_role("button", name="下一步", exact=True))
+            )
+            await next_button.click()
+
+            try:
+                await page.locator('input[name="password"]').wait_for(timeout=10000)
+            except TimeoutError:
+                verification_text_regex = re.compile("(unusual|verify|suspicious|验证|异常)", re.IGNORECASE)
+                verification_locator = page.get_by_text(verification_text_regex)
+                
+                if await verification_locator.first.is_visible(timeout=1000):
+                    print("\n---")
+                    print("🛑 UNUSUAL ACTIVITY DETECTED BY X.COM 🛑")
+                    print("Please manually verify your account in a browser.")
+                    print("---\n")
+                    return
+                else:
+                    print("\nLogin failed: The password field did not appear, and no known verification page was detected.")
+                    raise
+            
             await page.locator('input[name="password"]').fill(self.password)
-            await page.get_by_role("button", name="Log in").click()
+
+            login_button = (
+                page.locator('[data-testid="LoginForm_Login_Button"]')
+                .or_(page.get_by_role("button", name="Log in", exact=True))
+                .or_(page.get_by_role("button", name="登录", exact=True))
+            )
+            await login_button.click()
+
             await expect(page.locator('[data-testid="primaryColumn"]')).to_be_visible(timeout=30000)
-            await page.context.storage_state(path=AUTH_STATE_PATH)
+            await page.context.storage_state(path=str(AUTH_STATE_PATH))
         finally:
             await page.context.close()
 
@@ -55,6 +98,12 @@ class XProductionCrawler:
         if not AUTH_STATE_PATH.exists():
             async def empty_generator(): yield
             return empty_generator() if scene in ["search", "home"] else {}
+        
+        page = await self.browser_manager.new_page(storage_state=str(AUTH_STATE_PATH))
+        if not page: 
+            async def empty_generator(): yield
+            return empty_generator() if scene in ["search", "home"] else {}
+
         try:
             scene_module_name = f"crawl4ai.crawlers.x_com.scenes.{scene.lower()}_scene"
             scene_module = importlib.import_module(scene_module_name)
@@ -64,10 +113,7 @@ class XProductionCrawler:
         except (ImportError, AttributeError) as e:
             async def empty_generator(): yield
             return empty_generator() if scene in ["search", "home"] else {}
-        page = await self.browser_manager.new_page(storage_state=str(AUTH_STATE_PATH))
-        if not page:
-            async def empty_generator(): yield
-            return empty_generator() if scene in ["search", "home"] else {}
+
         result = scene_instance.scrape(page, **kwargs)
         if inspect.isasyncgen(result):
             async def page_managing_generator():
@@ -83,12 +129,6 @@ class XProductionCrawler:
             finally:
                 await page.context.close()
 
-class MockConfig:
-    def __init__(self):
-        load_dotenv()
-    def get(self, key):
-        return os.getenv(key)
-
 class MockBrowserManager:
     async def __aenter__(self):
         self.playwright = await async_playwright().start()
@@ -96,49 +136,65 @@ class MockBrowserManager:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.playwright.stop()
     async def new_page(self, headless=True, storage_state=None):
-        browser = await self.playwright.chromium.launch(headless=headless)
+        proxy_server = config.PROXY_SERVER
+        launch_options = {"headless": headless}
+        if proxy_server:
+            launch_options["proxy"] = {"server": proxy_server}
+            print(f"Using proxy server: {proxy_server}")
+
+        browser = await self.playwright.chromium.launch(**launch_options)
         context = await browser.new_context(storage_state=storage_state)
         page = await context.new_page()
+        
+        await stealth_async(page)
+
         original_close = page.close
         page.close = lambda: asyncio.gather(original_close(), context.close())
         return page
 
 async def main(args):
-    """
-    Main function with the final, intuitive, and correct logic.
-    """
     print("--- Running XProductionCrawler in Standalone Test Mode ---")
-    mock_config = MockConfig()
     kafka_producer = None
     run_output_dir = None
 
+    if args.login:
+        print("\nLogin-only mode. Attempting to log in and create auth file...")
+        async with MockBrowserManager() as mock_browser_manager:
+            crawler = XProductionCrawler(config=config, browser_manager=mock_browser_manager)
+            await crawler.login()
+            if AUTH_STATE_PATH.exists():
+                print(f"Login successful. Auth file created/updated at {AUTH_STATE_PATH}")
+            else:
+                print("Login failed. Could not create auth file.")
+        return
+
     if args.output_method == 'kafka':
-        broker_url = os.getenv("KAFKA_BROKER_URL", "localhost:9092")
-        kafka_topic = os.getenv("KAFKA_TOPIC", "x_com_scraped_data")
+        broker_url = config.KAFKA_BOOTSTRAP_SERVERS or "localhost:9092"
+        kafka_topic = config.KAFKA_TOPIC or "x_com_scraped_data"
         topic_ready = await ensure_topic_exists(bootstrap_servers=broker_url, topic_name=kafka_topic)
         if not topic_ready: return
         kafka_producer = AIOKafkaProducer(bootstrap_servers=broker_url)
         await kafka_producer.start()
     else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_output_dir = Path(__file__).parent / "out" / "scraped" / f"{args.output_prefix}_{timestamp}"
+        run_output_dir = Path(__file__).parent / "out" / "scraped" / f"{args.output_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         run_output_dir.mkdir(parents=True, exist_ok=True)
         print(f"Outputting batch files to: {run_output_dir}")
 
     try:
         async with MockBrowserManager() as mock_browser_manager:
-            crawler = XProductionCrawler(config=mock_config, browser_manager=mock_browser_manager)
-            if args.login:
-                await crawler.login()
-                return
+            crawler = XProductionCrawler(config=config, browser_manager=mock_browser_manager)
+
             if not AUTH_STATE_PATH.exists():
-                print("\nAuth file not found. Please run with --login first.")
-                return
+                print("\nAuth file not found. Initiating automatic login...")
+                await crawler.login()
+                if not AUTH_STATE_PATH.exists():
+                    print("\nAutomatic login failed. Could not create auth file. Please check credentials or manually verify account. Exiting.")
+                    return
+                print("Login successful. Auth file created. Proceeding with scraping...")
 
             batch_num = 0
             scanner = await crawler.scrape("search", query=args.keyword, scroll_count=args.scan_scrolls)
             
-            # --- THE FIX for Replies: This logic is now simple and intuitive ---
             should_fetch_replies = args.max_replies > 0
 
             async for url_batch in scanner:
@@ -149,7 +205,7 @@ async def main(args):
                     detailed_data = await crawler.scrape(
                         "tweet_detail",
                         url=url,
-                        include_replies=should_fetch_replies, # Use the correct flag
+                        include_replies=should_fetch_replies,
                         max_replies=args.max_replies,
                         reply_scroll_count=args.reply_scrolls
                     )
@@ -173,10 +229,9 @@ async def main(args):
             print("Kafka producer stopped.")
 
 if __name__ == "__main__":
-    # This argument parser is now correct and final.
     parser = argparse.ArgumentParser(description="Scrape X.com for tweets in real-time.")
     login_group = parser.add_argument_group('Authentication')
-    login_group.add_argument("--login", action="store_true", help="Perform the login process.")
+    login_group.add_argument("--login", action="store_true", help="Perform the login process and exit.")
     scrape_group = parser.add_argument_group('Scraping Options')
     scrape_group.add_argument("--keyword", type=str, help="The search keyword to use.")
     scrape_group.add_argument("--scan-scrolls", type=int, default=1, help="Number of scrolls during URL scan (default: 1).")

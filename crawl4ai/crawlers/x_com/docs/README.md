@@ -13,7 +13,10 @@
 * 输出的文件名前缀为 nvidia_scrape (--output-prefix nvidia_scrape)
 
 运行命令：
+首次登录（生成认证文件）
+python -m crawl4ai.crawlers.x_com.production_crawler --login
 根目录下执行：
-python -m crawl4ai.crawlers.x_com.production_crawler --keyword "OpenAI" --fetch-replies
+python -m crawl4ai.crawlers.x_com.production_crawler --keyword "OpenAI"
 所有参数：
-python -m crawl4ai.crawlers.x_com.production_crawler --keyword "Nvidia" --scan-scrolls 3 --fetch-replies --max-replies 5 --reply-scrolls 10 --output-prefix nvidia_scrape
+python -m crawl4ai.crawlers.x_com.production_crawler --keyword "generative AI" --scan-scrolls 3 --max-replies 10 --reply-scrolls 8 --output-method kafka --kafka-key-prefix "x.com"
+
