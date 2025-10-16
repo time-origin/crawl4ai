@@ -30,6 +30,7 @@ logger = class_logger()
 
 # --- Dynamically determine the auth state path ---
 auth_json_path_from_config = getattr(config, 'AUTH_JSON_PATH', None)
+
 if auth_json_path_from_config:
     AUTH_STATE_PATH = Path(auth_json_path_from_config)
     print(f"Using authentication file from config: {AUTH_STATE_PATH}")
@@ -45,10 +46,11 @@ class XProductionCrawler:
         self.password = self.config.X_PASSWORD
 
     async def login(self):
+        # This method is intended for local execution to generate the auth file.
         if not self.username or not self.password:
             print("Login credentials (X_USERNAME, X_PASSWORD) not found in environment variables.")
             return
-        page = await self.browser_manager.new_page(headless=True)
+        page = await self.browser_manager.new_page(headless=False) # Login should not be headless
         if not page: return
         try:
             await page.goto("https://x.com/login", wait_until="domcontentloaded")
@@ -74,18 +76,8 @@ class XProductionCrawler:
             try:
                 await page.locator('input[name="password"]').wait_for(timeout=10000)
             except TimeoutError:
-                verification_text_regex = re.compile("(unusual|verify|suspicious|验证|异常)", re.IGNORECASE)
-                verification_locator = page.get_by_text(verification_text_regex)
-                
-                if await verification_locator.first.is_visible(timeout=1000):
-                    print("\n---")
-                    print("🛑 UNUSUAL ACTIVITY DETECTED BY X.COM 🛑")
-                    print("Please manually verify your account in a browser.")
-                    print("---\n")
-                    return
-                else:
-                    print("\nLogin failed: The password field did not appear, and no known verification page was detected.")
-                    raise
+                print("\nLogin failed: The password field did not appear.")
+                raise
             
             await page.locator('input[name="password"]').fill(self.password)
 
@@ -102,8 +94,6 @@ class XProductionCrawler:
             await page.context.close()
 
     async def scrape(self, scene: str, **kwargs):
-        # NOTE: The check for the auth file is now done in the main() function
-        # for clearer logging before any browser action starts.
         page = await self.browser_manager.new_page(storage_state=str(AUTH_STATE_PATH))
         if not page: 
             async def empty_generator(): yield
@@ -116,6 +106,7 @@ class XProductionCrawler:
             SceneClass = getattr(scene_module, scene_class_name)
             scene_instance = SceneClass()
         except (ImportError, AttributeError) as e:
+            print(f"Error dynamically importing scene '{scene}': {e}")
             async def empty_generator(): yield
             return empty_generator() if scene in ["search", "home"] else {}
 
@@ -140,9 +131,23 @@ class MockBrowserManager:
         return self
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.playwright.stop()
+
     async def new_page(self, headless=True, storage_state=None):
         proxy_server = config.PROXY_SERVER
-        launch_options = {"headless": headless}
+        
+        # [CHG] Add essential arguments for running in headless/server/container environments
+        browser_args = [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',  # Often needed in containers
+            '--disable-gpu'  # Can prevent some crashes in headless mode
+        ]
+
+        launch_options = {
+            "headless": headless, 
+            "args": browser_args
+        }
+
         if proxy_server:
             launch_options["proxy"] = {"server": proxy_server}
             print(f"Using proxy server: {proxy_server}")
@@ -153,45 +158,52 @@ class MockBrowserManager:
         
         await stealth_async(page)
 
-        original_close = page.close
-        page.close = lambda: asyncio.gather(original_close(), context.close())
         return page
 
 async def main(args):
     print("--- Running XProductionCrawler in Standalone Test Mode ---")
+
+    # [CHG] The --login flag is now only for local auth file generation.
+    if args.login:
+        print("\nLogin-only mode. Attempting to generate auth file...")
+        async with MockBrowserManager() as mock_browser_manager:
+            crawler = XProductionCrawler(config=config, browser_manager=mock_browser_manager)
+            await crawler.login()
+        if AUTH_STATE_PATH.exists():
+            print(f"Login successful. Auth file created/updated at {AUTH_STATE_PATH}")
+        else:
+            print("Login failed. Could not create auth file.")
+        return
+
+    # --- Main Scraping Logic ---
     kafka_producer = None
     run_output_dir = None
 
-    if args.output_method == 'kafka':
-        broker_url = config.KAFKA_BOOTSTRAP_SERVERS or "localhost:9092"
-        kafka_topic = config.KAFKA_TOPIC or "x_com_scraped_data"
-        topic_ready = await ensure_topic_exists(bootstrap_servers=broker_url, topic_name=kafka_topic)
-        if not topic_ready: return
-        kafka_producer = AIOKafkaProducer(bootstrap_servers=broker_url)
-        await kafka_producer.start()
-    else:
-        run_output_dir = Path(__file__).parent / "out" / "scraped" / f"{args.output_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        run_output_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Outputting batch files to: {run_output_dir}")
-
     try:
-        # [CHG] Add explicit check and logging for the auth file path
         print(f"\nChecking for auth file at: '{AUTH_STATE_PATH}'")
         if not AUTH_STATE_PATH.exists():
-            print("Auth file does NOT exist. Initiating automatic login...")
-            async with MockBrowserManager() as mock_browser_manager:
-                crawler = XProductionCrawler(config=config, browser_manager=mock_browser_manager)
-                await crawler.login()
-                if not AUTH_STATE_PATH.exists():
-                    print("\nAutomatic login failed. Could not create auth file. Please check credentials or manually verify account. Exiting.")
-                    return
-            print("Login successful. Auth file created. Proceeding with scraping...")
+            print(f"❌ Auth file NOT FOUND at '{AUTH_STATE_PATH}'.")
+            print("Please run this script with the --login flag on a machine with a GUI to generate the auth file first, then deploy it with the executable.")
+            return
         else:
-            print("Auth file found. Proceeding with scraping...")
+            print("✅ Auth file found. Proceeding with scraping...")
+
+        if args.output_method == 'kafka':
+            broker_url = config.KAFKA_BOOTSTRAP_SERVERS or "localhost:9092"
+            kafka_topic = config.KAFKA_TOPIC or "x_com_scraped_data"
+            topic_ready = await ensure_topic_exists(bootstrap_servers=broker_url, topic_name=kafka_topic)
+            if not topic_ready: return
+            kafka_producer = AIOKafkaProducer(bootstrap_servers=broker_url)
+            await kafka_producer.start()
+        else:
+            run_output_dir = Path(__file__).parent / "out" / "scraped" / f"{args.output_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            run_output_dir.mkdir(parents=True, exist_ok=True)
+            print(f"Outputting batch files to: {run_output_dir}")
 
         async with MockBrowserManager() as mock_browser_manager:
             crawler = XProductionCrawler(config=config, browser_manager=mock_browser_manager)
             batch_num = 0
+            print("--- Scanning Search Scene for Tweet URLs ---")
             scanner = await crawler.scrape("search", query=args.keyword, scroll_count=args.scan_scrolls)
             
             should_fetch_replies = args.max_replies > 0
