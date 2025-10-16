@@ -25,7 +25,14 @@
 
 ---
 
-### 第2步：构建 Docker 镜像
+### 第2步：准备外部配置文件
+
+将您的 `.env` 文件和 `auth_state.json` 文件都放置在宿主机的一个固定目录下，例如您指定的：
+`/home/gyq/workspace/game_data/resources/xcom_auth/`
+
+---
+
+### 第3步：构建 Docker 镜像
 
 在项目根目录 (`crawl4ai/`) 下打开终端，运行以下命令。这个命令会使用我们项目中的 `Dockerfile-custom` 文件来创建一个名为 `crawl4ai-xcom` 的镜像。
 
@@ -33,32 +40,51 @@
 docker build -t crawl4ai-xcom -f Dockerfile-custom .
 ```
 
-**命令解释:**
-*   `-t crawl4ai-xcom`: 为我们构建的镜像命名，方便后续使用。
-*   `-f Dockerfile-custom`: **(关键)** 明确指定使用 `Dockerfile-custom` 这个自定义文件进行构建。
-*   `.`: 代表将当前目录（项目根目录）作为构建上下文，这样 Docker 才能访问到项目中的所有文件。
-
 ---
 
-### 第3步：运行 Docker 容器 (最终执行)
+### 第4步：运行容器
 
-镜像构建成功后，您可以在任何安装了 Docker 的机器上，使用以下命令来运行您的爬虫。这条命令整合了网络连接、文件挂载和环境变量配置。
+我们提供两种方式来运行容器：直接使用 `docker run` 命令，或者使用 `docker-compose`（更推荐）。
+
+#### 方式一：使用 `docker run` 命令
+
+此方式直接、灵活，适合快速测试或在不方便创建 `docker-compose.yml` 文件的环境中使用。
 
 ```sh
 docker run --rm -it \
   --add-host=host.docker.internal:host-gateway \
-  -v "/path/on/your/host/to/auth_state.json:/app/auth_state.json" \
+  -v "/home/gyq/workspace/game_data/resources/xcom_auth/.env:/app/.env" \
+  -v "/home/gyq/workspace/game_data/resources/xcom_auth/auth_state.json:/app/auth_state.json" \
   -e PROXY_SERVER="http://host.docker.internal:7890" \
   -e AUTH_JSON_PATH="/app/auth_state.json" \
   crawl4ai-xcom \
-  python -m crawl4ai.crawlers.x_com.production_crawler --keyword "generative AI" --scan-scrolls 3
+  python -m crawl4ai.crawlers.x_com.production_crawler \
+    --keyword "generative AI" \
+    --scan-scrolls 3 \
+    --max-replies 10 \
+    --reply-scrolls 8 \
+    --output-method kafka \
+    --kafka-key-prefix "x.com"
 ```
 
-**命令参数详解:**
+#### 方式二：使用 `docker-compose` (更推荐)
 
-*   `--add-host=host.docker.internal:host-gateway`: **(Linux 系统关键)** 确保容器能通过 `host.docker.internal` 这个名字找到宿主机，以便连接代理。
-*   `-v "/path/on/your/host/...:/app/auth_state.json"`: **(挂载文件)** 将您**宿主机**上的认证文件**映射**到**容器内**的 `/app/auth_state.json`。 **请务必将前面的路径替换为您 `auth_state.json` 文件在宿主机上的真实绝对路径。**
-*   `-e PROXY_SERVER="..."`: 通过环境变量设置代理服务器地址。`7890` 是 Clash 默认的 HTTP 代理端口，如果您的配置不同，请在此处修改。
-*   `-e AUTH_JSON_PATH="..."`: 通过环境变量告诉程序，认证文件在**容器内**的路径。
-*   `crawl4ai-xcom`: 我们刚刚构建的镜像名称。
-*   `python -m ...`: 您想在容器内执行的完整爬虫命令。
+此方式将所有复杂的配置都固化在 `docker-compose-custom.yml` 文件中，使得启动命令极其简单，是规范化部署的最佳实践。
+
+**1. 检查 `docker-compose-custom.yml` 文件**
+
+确保项目根目录下的 `docker-compose-custom.yml` 文件内容正确无误（我们已在上一步创建）。
+
+**2. 启动服务**
+
+在项目根目录 (`crawl4ai/`) 下打开终端，运行以下命令：
+
+```sh
+docker-compose -f docker-compose-custom.yml up
+```
+
+**命令解释:**
+*   `-f docker-compose-custom.yml`: 明确指定使用我们自定义的 compose 文件。
+*   `up`: 创建并启动在 compose 文件中定义的服务。添加 `--build` 参数可以在启动前强制重新构建镜像，例如 `docker-compose ... up --build`。
+
+Docker Compose 会自动读取文件中的所有配置（镜像名、网络、挂载、环境变量、要执行的命令等），然后为您启动容器。这使得您的每次运行都变得简单、一致且不易出错。
