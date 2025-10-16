@@ -6,6 +6,9 @@ __pycache__/
 # Environment
 .env
 
+build
+production_crawler_win.spec
+
 # Virtual Environments
 .venv/
 venv/
@@ -14,3 +17,4 @@ env/
 # Playwright session state
 auth_state.json
 state.json
+*batch_*.*

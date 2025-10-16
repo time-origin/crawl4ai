@@ -1,0 +1,27 @@
+# Use a lightweight Python base image
+FROM python:3.12-slim-bookworm
+
+# Accept proxy settings as build arguments from the --build-arg flag
+ARG PROXY_URL
+
+# Set environment variables for the proxy *only for the build process*
+ENV http_proxy=$PROXY_URL
+ENV https_proxy=$PROXY_URL
+
+# Install curl, which is not included in the slim image
+# This RUN command will now use the proxy settings to access the internet
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+# Unset the proxy environment variables after installation.
+# This is good practice to avoid them interfering with the final app if not needed.
+ENV http_proxy=""
+ENV https_proxy=""
+
+# Set the working directory inside the container
+WORKDIR /app
+
+# Copy the test script from its specific location into the container's working directory
+COPY crawl4ai/crawlers/x_com/test_proxy.py .
+
+# The command to run when the container starts
+CMD ["python", "test_proxy.py"]

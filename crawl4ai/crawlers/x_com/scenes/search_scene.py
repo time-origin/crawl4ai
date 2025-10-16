@@ -1,7 +1,7 @@
 # crawl4ai/crawlers/x_com/scenes/search_scene.py
 
 import asyncio
-from playwright.async_api import Page, expect
+from playwright.async_api import Page, expect, TimeoutError
 from .base_scene import BaseScene
 import urllib.parse
 
@@ -28,6 +28,9 @@ class SearchScene(BaseScene):
         
         await page.goto(search_url, wait_until="domcontentloaded")
         print(f"Navigated to search page for query: '{query}' with filter: '{filter_mode}'")
+        
+        # 添加调试：等待页面加载
+        await page.wait_for_timeout(3000)
 
         primary_column = page.locator('[data-testid="primaryColumn"]')
         await expect(primary_column.locator('article[data-testid="tweet"]').first).to_be_visible(timeout=15000)
