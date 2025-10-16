@@ -31,3 +31,6 @@ X_PASSWORD = os.getenv("X_PASSWORD")
 
 # 代理服务器
 PROXY_SERVER = os.getenv("PROXY_SERVER")
+
+# 认证文件路径
+AUTH_JSON_PATH = os.getenv("AUTH_JSON_PATH")

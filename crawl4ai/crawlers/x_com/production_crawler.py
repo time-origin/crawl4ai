@@ -28,7 +28,14 @@ if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
 class_logger = type("Logger", (), {"info": print, "warning": print, "error": print})
 logger = class_logger()
 
-AUTH_STATE_PATH = Path(__file__).parent / "auth_state.json"
+# --- Dynamically determine the auth state path ---
+auth_json_path_from_config = getattr(config, 'AUTH_JSON_PATH', None)
+if auth_json_path_from_config:
+    AUTH_STATE_PATH = Path(auth_json_path_from_config)
+    print(f"Using authentication file from config: {AUTH_STATE_PATH}")
+else:
+    AUTH_STATE_PATH = Path(__file__).parent / "auth_state.json"
+    print(f"Using default authentication file: {AUTH_STATE_PATH}")
 
 class XProductionCrawler:
     def __init__(self, config, browser_manager):
@@ -95,10 +102,8 @@ class XProductionCrawler:
             await page.context.close()
 
     async def scrape(self, scene: str, **kwargs):
-        if not AUTH_STATE_PATH.exists():
-            async def empty_generator(): yield
-            return empty_generator() if scene in ["search", "home"] else {}
-        
+        # NOTE: The check for the auth file is now done in the main() function
+        # for clearer logging before any browser action starts.
         page = await self.browser_manager.new_page(storage_state=str(AUTH_STATE_PATH))
         if not page: 
             async def empty_generator(): yield
@@ -157,17 +162,6 @@ async def main(args):
     kafka_producer = None
     run_output_dir = None
 
-    if args.login:
-        print("\nLogin-only mode. Attempting to log in and create auth file...")
-        async with MockBrowserManager() as mock_browser_manager:
-            crawler = XProductionCrawler(config=config, browser_manager=mock_browser_manager)
-            await crawler.login()
-            if AUTH_STATE_PATH.exists():
-                print(f"Login successful. Auth file created/updated at {AUTH_STATE_PATH}")
-            else:
-                print("Login failed. Could not create auth file.")
-        return
-
     if args.output_method == 'kafka':
         broker_url = config.KAFKA_BOOTSTRAP_SERVERS or "localhost:9092"
         kafka_topic = config.KAFKA_TOPIC or "x_com_scraped_data"
@@ -181,17 +175,22 @@ async def main(args):
         print(f"Outputting batch files to: {run_output_dir}")
 
     try:
-        async with MockBrowserManager() as mock_browser_manager:
-            crawler = XProductionCrawler(config=config, browser_manager=mock_browser_manager)
-
-            if not AUTH_STATE_PATH.exists():
-                print("\nAuth file not found. Initiating automatic login...")
+        # [CHG] Add explicit check and logging for the auth file path
+        print(f"\nChecking for auth file at: '{AUTH_STATE_PATH}'")
+        if not AUTH_STATE_PATH.exists():
+            print("Auth file does NOT exist. Initiating automatic login...")
+            async with MockBrowserManager() as mock_browser_manager:
+                crawler = XProductionCrawler(config=config, browser_manager=mock_browser_manager)
                 await crawler.login()
                 if not AUTH_STATE_PATH.exists():
                     print("\nAutomatic login failed. Could not create auth file. Please check credentials or manually verify account. Exiting.")
                     return
-                print("Login successful. Auth file created. Proceeding with scraping...")
+            print("Login successful. Auth file created. Proceeding with scraping...")
+        else:
+            print("Auth file found. Proceeding with scraping...")
 
+        async with MockBrowserManager() as mock_browser_manager:
+            crawler = XProductionCrawler(config=config, browser_manager=mock_browser_manager)
             batch_num = 0
             scanner = await crawler.scrape("search", query=args.keyword, scroll_count=args.scan_scrolls)
             
