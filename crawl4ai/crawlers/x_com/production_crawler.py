@@ -16,7 +16,8 @@ from playwright_stealth import stealth_async
 # --- [FIX] Changed relative imports to absolute for PyInstaller compatibility ---
 from crawl4ai.crawlers.x_com import config
 from crawl4ai.crawlers.x_com.output_handler import save_batch_to_file
-from crawl4ai.crawlers.x_com.kafka_manager import send_to_kafka, ensure_topic_exists
+# [CHG] Import the new function for sending the task init message
+from crawl4ai.crawlers.x_com.kafka_manager import send_to_kafka, ensure_topic_exists, send_task_init_message
 from aiokafka import AIOKafkaProducer
 
 # --- Logic for Bundled Execution ---
@@ -135,12 +136,11 @@ class MockBrowserManager:
     async def new_page(self, headless=True, storage_state=None):
         proxy_server = config.PROXY_SERVER
         
-        # [CHG] Add essential arguments for running in headless/server/container environments
         browser_args = [
             '--no-sandbox',
             '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',  # Often needed in containers
-            '--disable-gpu'  # Can prevent some crashes in headless mode
+            '--disable-dev-shm-usage',
+            '--disable-gpu'
         ]
 
         launch_options = {
@@ -163,7 +163,6 @@ class MockBrowserManager:
 async def main(args):
     print("--- Running XProductionCrawler in Standalone Test Mode ---")
 
-    # [CHG] The --login flag is now only for local auth file generation.
     if args.login:
         print("\nLogin-only mode. Attempting to generate auth file...")
         async with MockBrowserManager() as mock_browser_manager:
@@ -178,6 +177,8 @@ async def main(args):
     # --- Main Scraping Logic ---
     kafka_producer = None
     run_output_dir = None
+    broker_url = None
+    kafka_topic = None
 
     try:
         print(f"\nChecking for auth file at: '{AUTH_STATE_PATH}'")
@@ -202,13 +203,34 @@ async def main(args):
 
         async with MockBrowserManager() as mock_browser_manager:
             crawler = XProductionCrawler(config=config, browser_manager=mock_browser_manager)
-            batch_num = 0
+            
             print("--- Scanning Search Scene for Tweet URLs ---")
             scanner = await crawler.scrape("search", query=args.keyword, scroll_count=args.scan_scrolls)
             
-            should_fetch_replies = args.max_replies > 0
+            # [CHG] Collect all URLs first to get a total count
+            print("--- Collecting all tweet URLs before processing ---")
+            all_url_batches = [url_batch async for url_batch in scanner]
+            all_urls = [url for batch in all_url_batches for url in batch]
+            total_tweets = len(all_urls)
+            print(f"--- Collected a total of {total_tweets} URLs ---")
 
-            async for url_batch in scanner:
+            # [ADD] Send the TASK_INIT message to Kafka
+            if args.output_method == 'kafka' and total_tweets > 0:
+                task_control_topic = getattr(config, 'KAFKA_TASK_TOPIC', 'task_control_topic')
+                topic_ready = await ensure_topic_exists(bootstrap_servers=broker_url, topic_name=task_control_topic)
+                if topic_ready:
+                    print(f"--- Sending TASK_INIT to topic '{task_control_topic}' ---")
+                    await send_task_init_message(
+                        producer=kafka_producer,
+                        topic=task_control_topic,
+                        original_task_id=args.original_task_id,
+                        total_tweets=total_tweets
+                    )
+
+            # --- Original processing logic, now using the collected batches ---
+            batch_num = 0
+            should_fetch_replies = args.max_replies > 0
+            for url_batch in all_url_batches:
                 batch_num += 1
                 print(f"\n--- PROCESSING BATCH {batch_num} ({len(url_batch)} URLs) ---")
                 batch_details = []
@@ -241,18 +263,27 @@ async def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Scrape X.com for tweets in real-time.")
+    
+    # [ADD] New required argument for task identification
+    task_group = parser.add_argument_group('Task Identification')
+    task_group.add_argument("--original-task-id", type=int, required=True, help="The original task ID from the calling service.")
+
     login_group = parser.add_argument_group('Authentication')
     login_group.add_argument("--login", action="store_true", help="Perform the login process and exit.")
+    
     scrape_group = parser.add_argument_group('Scraping Options')
     scrape_group.add_argument("--keyword", type=str, help="The search keyword to use.")
     scrape_group.add_argument("--scan-scrolls", type=int, default=1, help="Number of scrolls during URL scan (default: 1).")
     scrape_group.add_argument("--max-replies", type=int, default=0, help="Max replies to fetch. > 0 enables reply scraping.")
     scrape_group.add_argument("--reply-scrolls", type=int, default=5, help="Max scrolls to find replies (default: 5).")
+    
     output_group = parser.add_argument_group('Output Options')
     output_group.add_argument("--output-method", type=str, choices=['file', 'kafka'], default='file', help="Choose output method: file or kafka.")
     output_group.add_argument("--output-prefix", type=str, default="x_com_scrape", help="Prefix for the run-specific output directory.")
     output_group.add_argument("--kafka-key-prefix", type=str, default="x.com", help="Prefix for the Kafka message key (default: x.com).")
+    
     parsed_args = parser.parse_args()
     if not parsed_args.login and not parsed_args.keyword:
         parser.error("the --keyword argument is required when not performing --login.")
+    
     asyncio.run(main(parsed_args))

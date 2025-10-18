@@ -52,20 +52,13 @@ async def send_to_kafka(producer: AIOKafkaProducer, topic: str, data: list, keyw
     print(f"\n--- Sending {len(data)} individual messages to Kafka topic '{topic}' ---")
     tasks = []
     for item in data:
-        # --- FIX: Add ID extraction and construct the new key ---
-        # full_url = item.get("url", "")
-        # tweet_id = full_url.split("/")[-1] if "/status/" in full_url else ""
-        #
-        # # Add the new ID field to the item itself
-        # item['id'] = tweet_id
         tweet_id = item.get("id", "")
+        # [CHG] Add original_task_id to the main data payload
         message_object = {
-            "keyword": keyword,
             "tweet_data": item
         }
         message_value = json.dumps(message_object, ensure_ascii=False).encode('utf-8')
         
-        # Construct the key with the prefix, e.g., "x.com:123456789"
         message_key = f"{key_prefix}:{tweet_id}".encode('utf-8')
         
         print(f"Sending message with key: {message_key.decode('utf-8')}")
@@ -73,3 +66,35 @@ async def send_to_kafka(producer: AIOKafkaProducer, topic: str, data: list, keyw
     
     await asyncio.gather(*tasks)
     print(f"Successfully sent batch of {len(data)} messages to Kafka.")
+
+# [ADD] New function to send the task initialization message
+async def send_task_init_message(producer: AIOKafkaProducer, topic: str, original_task_id: int, total_tweets: int):
+    """
+    Sends a single TASK_INIT message to Kafka to signal the start and scale of a job.
+
+    Args:
+        producer: An already started AIOKafkaProducer instance.
+        topic (str): The Kafka topic for task control messages.
+        original_task_id (int): The unique ID for the entire task.
+        total_tweets (int): The total number of tweets that will be processed.
+    """
+    message_object = {
+        "type": "TASK_INIT",
+        "original_task_id": original_task_id,
+        "total_tweets": total_tweets
+    }
+    message_value = json.dumps(message_object, ensure_ascii=False).encode('utf-8')
+    
+    # Use the original_task_id as the key to ensure messages for the same task are ordered.
+    message_key = str(original_task_id).encode('utf-8')
+    
+    print(f"--- Sending TASK_INIT message to topic '{topic}' ---")
+    print(f"    Key: {message_key.decode('utf-8')}")
+    print(f"    Value: {message_value.decode('utf-8')}")
+    
+    try:
+        # Using send_and_wait to ensure this critical message is sent before proceeding.
+        await producer.send_and_wait(topic, value=message_value, key=message_key)
+        print("--- Successfully sent TASK_INIT message. ---")
+    except Exception as e:
+        print(f"--- 🛑 Failed to send TASK_INIT message: {e} ---")
