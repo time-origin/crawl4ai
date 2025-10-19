@@ -10,6 +10,7 @@ import argparse
 import re
 import inspect
 from datetime import datetime
+from typing import List, Dict, Any
 
 from playwright_stealth import stealth_async
 
@@ -38,6 +39,39 @@ if auth_json_path_from_config:
 else:
     AUTH_STATE_PATH = Path(__file__).parent / "auth_state.json"
     print(f"Using default authentication file: {AUTH_STATE_PATH}")
+
+
+def filter_and_log_valid_tweets(all_detailed_tweets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    过滤推文列表，只保留那些实际抓取到回复内容的推文，并记录日志。
+    
+    Args:
+        all_detailed_tweets: 包含所有已抓取推文详情的列表。
+
+    Returns:
+        一个只包含有效推文（即 replies 列表不为空）的新列表。
+    """
+    logger.info("--- [步骤 3/5] 开始过滤推文，只保留包含实际回复内容的推文 ---")
+    
+    valid_tweets = []
+    for tweet_data in all_detailed_tweets:
+        # 过滤条件：推文数据存在，且'replies'列表不为空
+        if tweet_data and isinstance(tweet_data.get("replies"), list) and len(tweet_data["replies"]) > 0:
+            valid_tweets.append(tweet_data)
+        else:
+            url_to_log = tweet_data.get('url', 'N/A') if tweet_data else 'N/A'
+            logger.info(f"  [过滤] 推文 {url_to_log} 已被跳过，原因：未能抓取到任何实际的回复内容。")
+
+    logger.info(f"--- 过滤完成。在 {len(all_detailed_tweets)} 条推文中，发现 {len(valid_tweets)} 条有效推文。 ---")
+
+    # 如果存在有效推文，则打印其ID和URL列表
+    if valid_tweets:
+        logger.info("--- 以下是所有有效推文的列表 (ID 和 URL) ---")
+        for tweet in valid_tweets:
+            logger.info(f"  [有效] ID: {tweet.get('id', 'N/A')}, URL: {tweet.get('url', 'N/A')}")
+    
+    return valid_tweets
+
 
 class XProductionCrawler:
     def __init__(self, config, browser_manager):
@@ -161,33 +195,33 @@ class MockBrowserManager:
         return page
 
 async def main(args):
-    print("--- Running XProductionCrawler in Standalone Test Mode ---")
+    print("--- X.com 生产环境爬虫启动 ---")
 
     if args.login:
-        print("\nLogin-only mode. Attempting to generate auth file...")
+        print("\n仅执行登录模式，正在尝试生成认证文件...")
         async with MockBrowserManager() as mock_browser_manager:
             crawler = XProductionCrawler(config=config, browser_manager=mock_browser_manager)
             await crawler.login()
         if AUTH_STATE_PATH.exists():
-            print(f"Login successful. Auth file created/updated at {AUTH_STATE_PATH}")
+            print(f"登录成功。认证文件已在 {AUTH_STATE_PATH} 创建/更新。")
         else:
-            print("Login failed. Could not create auth file.")
+            print("登录失败，未能创建认证文件。")
         return
 
-    # --- Main Scraping Logic ---
+    # --- 主抓取逻辑 ---
     kafka_producer = None
     run_output_dir = None
     broker_url = None
     kafka_topic = None
 
     try:
-        print(f"\nChecking for auth file at: '{AUTH_STATE_PATH}'")
+        print(f"\n正在检查认证文件: '{AUTH_STATE_PATH}'")
         if not AUTH_STATE_PATH.exists():
-            print(f"❌ Auth file NOT FOUND at '{AUTH_STATE_PATH}'.")
-            print("Please run this script with the --login flag on a machine with a GUI to generate the auth file first, then deploy it with the executable.")
+            print(f"❌ 认证文件未找到: '{AUTH_STATE_PATH}'.")
+            print("请先在带有图形界面的机器上使用 --login 参数运行此脚本以生成认证文件，然后将其与可执行文件一起部署。")
             return
         else:
-            print("✅ Auth file found. Proceeding with scraping...")
+            print("✅ 认证文件已找到，开始抓取流程...")
 
         if args.output_method == 'kafka':
             broker_url = config.KAFKA_BOOTSTRAP_SERVERS or "localhost:9092"
@@ -199,74 +233,75 @@ async def main(args):
         else:
             run_output_dir = Path(__file__).parent / "out" / "scraped" / f"{args.output_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             run_output_dir.mkdir(parents=True, exist_ok=True)
-            print(f"Outputting batch files to: {run_output_dir}")
+            print(f"文件批次输出目录: {run_output_dir}")
 
         async with MockBrowserManager() as mock_browser_manager:
             crawler = XProductionCrawler(config=config, browser_manager=mock_browser_manager)
             
-            logger.info("--- Scanning Search Scene for Tweet URLs ---")
+            # =============================================================================
+            # 步骤 1/5: 扫描所有潜在的推文 URL
+            # =============================================================================
+            logger.info("--- [步骤 1/5] 开始扫描搜索结果页，获取所有推文的URL ---")
             scanner = await crawler.scrape("search", query=args.keyword, scroll_count=args.scan_scrolls)
-            
-            logger.info("--- Collecting all tweet URLs before processing ---")
             all_url_batches = [url_batch async for url_batch in scanner]
             all_urls = [url for batch in all_url_batches for url in batch]
-            logger.info(f"--- Collected a total of {len(all_urls)} URLs for potential scraping ---")
+            logger.info(f"--- URL扫描完成，共发现 {len(all_urls)} 条潜在的推文URL。 ---")
 
-            # [新增] 收集并过滤所有详细推文数据
-            all_filtered_tweets = []
-            should_fetch_replies = args.max_replies > 0 # 确保此变量已定义
-            logger.info("--- Fetching detailed tweet data and applying reply filter ---")
-            for url_batch in all_url_batches:
-                for url in url_batch:
-                    detailed_data = await crawler.scrape(
-                        "tweet_detail",
-                        url=url,
-                        include_replies=should_fetch_replies,
-                        max_replies=args.max_replies,
-                        reply_scroll_count=args.reply_scrolls
-                    )
-                    # 过滤条件：如果推文有详细数据且包含回复，则保留
-                    if detailed_data and detailed_data.get("replies") and len(detailed_data["replies"]) > 0:
-                        all_filtered_tweets.append(detailed_data)
-                    else:
-                        logger.info(f"Skipping tweet {url} due to no replies.")
+            # =============================================================================
+            # 步骤 2/5: 抓取所有推文的详细数据
+            # =============================================================================
+            logger.info("--- [步骤 2/5] 开始为所有URL抓取详细的推文数据（包括回复） ---")
+            all_detailed_tweets = []
+            should_fetch_replies = args.max_replies > 0
+            for i, url in enumerate(all_urls, 1):
+                logger.info(f"  抓取进度: {i}/{len(all_urls)} - URL: {url}")
+                detailed_data = await crawler.scrape(
+                    "tweet_detail",
+                    url=url,
+                    include_replies=should_fetch_replies,
+                    max_replies=args.max_replies,
+                    reply_scroll_count=args.reply_scrolls
+                )
+                all_detailed_tweets.append(detailed_data)
+            logger.info("--- 所有URL的详细数据抓取完成。 ---")
 
-            # [修改] 根据过滤后的推文数量计算 total_tweets
+            # =============================================================================
+            # 步骤 3/5: 过滤推文并记录日志
+            # =============================================================================
+            all_filtered_tweets = filter_and_log_valid_tweets(all_detailed_tweets)
+
+            # =============================================================================
+            # 步骤 4/5: 计算最终数量并发送 TASK_INIT 消息
+            # =============================================================================
             total_tweets = len(all_filtered_tweets)
-            logger.info(f"--- After filtering, {total_tweets} tweets remain for processing ---")
-
-            # [新增] 打印有效的推文列表
-            if total_tweets > 0:
-                logger.info("--- 有效推文列表 (仅显示ID和URL) ---")
-                for tweet in all_filtered_tweets:
-                    logger.info(f"  ID: {tweet.get('id', 'N/A')}, URL: {tweet.get('url', 'N/A')}")
-
-            # [修改] 发送 TASK_INIT 消息到 Kafka (total_tweets 现在是过滤后的数量)
+            logger.info(f"--- [步骤 4/5] 计算有效推文总数完成，共 {total_tweets} 条。 ---")
             if args.output_method == 'kafka' and total_tweets > 0:
                 task_control_topic = getattr(config, 'KAFKA_TASK_TOPIC', 'task_control_topic')
                 topic_ready = await ensure_topic_exists(bootstrap_servers=broker_url, topic_name=task_control_topic)
                 if topic_ready:
-                    logger.info(f"--- Sending TASK_INIT to topic '{task_control_topic}' ---")
+                    logger.info(f"--- 准备向主题 '{task_control_topic}' 发送 TASK_INIT 初始化消息 ---")
                     await send_task_init_message(
                         producer=kafka_producer,
                         topic=task_control_topic,
                         original_task_id=args.original_task_id,
                         total_tweets=total_tweets
                     )
-
-            # [修改] 迭代过滤后的推文列表进行发送
-            # 可以根据需要调整批处理大小，这里使用一个示例值
+            
+            # =============================================================================
+            # 步骤 5/5: 批处理并分发有效的推文数据
+            # =============================================================================
+            logger.info(f"--- [步骤 5/5] 开始批处理并分发 {total_tweets} 条有效推文。 ---")
             batch_size = 10 
             for i in range(0, total_tweets, batch_size):
                 current_batch_tweets = all_filtered_tweets[i:i + batch_size]
                 batch_num = (i // batch_size) + 1
-                logger.info(f"\n--- PROCESSING BATCH {batch_num} ({len(current_batch_tweets)} filtered tweets) ---")
+                logger.info(f"\n--- 正在处理第 {batch_num} 批，包含 {len(current_batch_tweets)} 条推文 ---")
 
                 if args.output_method == 'kafka':
                     await send_to_kafka(
                         producer=kafka_producer,
                         topic=kafka_topic,
-                        data=current_batch_tweets, # 发送过滤后的批次
+                        data=current_batch_tweets,
                         keyword=args.keyword,
                         original_task_id=args.original_task_id,
                         key_prefix=args.kafka_key_prefix
@@ -275,13 +310,13 @@ async def main(args):
                     batch_file_path = run_output_dir / f"batch_{batch_num}.json"
                     await save_batch_to_file(data=current_batch_tweets, keyword=args.keyword, file_path=batch_file_path)
 
-            logger.info("\n--- Streaming Workflow Complete ---")
+            logger.info("\n--- 所有批次处理完毕，流式工作流完成。 ---")
 
     finally:
         if kafka_producer:
-            print("Stopping Kafka producer...")
+            print("正在停止 Kafka 生产者...")
             await kafka_producer.stop()
-            print("Kafka producer stopped.")
+            print("Kafka 生产者已停止。")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Scrape X.com for tweets in real-time.")
