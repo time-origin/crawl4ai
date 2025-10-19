@@ -16,8 +16,9 @@ X_PASSWORD = os.getenv("X_PASSWORD")
 PROXY_SERVER = os.getenv("PROXY_SERVER")
 
 # --- Kafka Configuration ---
-# Kafka bootstrap servers, comma-separated if multiple.
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+# [修正] 兼容 KAFKA_BOOTSTRAP_SERVERS 和 KAFKA_BROKER_URL 两个变量名
+# 优先使用 KAFKA_BOOTSTRAP_SERVERS，如果不存在，则尝试 KAFKA_BROKER_URL
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BROKER_URL")
 
 # The main topic to which scraped tweet data will be sent.
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "x_com_scraped_data")
