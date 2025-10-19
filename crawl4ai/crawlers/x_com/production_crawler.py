@@ -60,7 +60,7 @@ def filter_and_log_valid_tweets(all_detailed_tweets: List[Dict[str, Any]]) -> Li
             valid_tweets.append(tweet_data)
         else:
             url_to_log = tweet_data.get('url', 'N/A') if tweet_data else 'N/A'
-            logger.info(f"  [过滤] 推文 {url_to_log} 已被跳过，原因：未能抓取到任何实际的回复内容。")
+            logger.info(f"  [过滤] 推文 {url_to_log} 已被跳过，原因：在所有尝试后，仍未能抓取到任何实际的回复内容。")
 
     logger.info(f"--- 过滤完成。在 {len(all_detailed_tweets)} 条推文中，发现 {len(valid_tweets)} 条有效推文。 ---")
 
@@ -248,21 +248,43 @@ async def main(args):
             logger.info(f"--- URL扫描完成，共发现 {len(all_urls)} 条潜在的推文URL。 ---")
 
             # =============================================================================
-            # 步骤 2/5: 抓取所有推文的详细数据
+            # 步骤 2/5: 抓取所有推文的详细数据 (包含重试逻辑)
             # =============================================================================
-            logger.info("--- [步骤 2/5] 开始为所有URL抓取详细的推文数据（包括回复） ---")
+            logger.info("--- [步骤 2/5] 开始为所有URL抓取详细的推文数据（包含重试） ---")
             all_detailed_tweets = []
             should_fetch_replies = args.max_replies > 0
+            max_retries = getattr(config, 'MAX_RETRIES_ON_FAILURE', 1)
+
             for i, url in enumerate(all_urls, 1):
                 logger.info(f"  抓取进度: {i}/{len(all_urls)} - URL: {url}")
-                detailed_data = await crawler.scrape(
-                    "tweet_detail",
-                    url=url,
-                    include_replies=should_fetch_replies,
-                    max_replies=args.max_replies,
-                    reply_scroll_count=args.reply_scrolls
-                )
+                
+                detailed_data = None
+                # 总尝试次数 = 1 (首次) + max_retries
+                for attempt in range(1 + max_retries):
+                    detailed_data = await crawler.scrape(
+                        "tweet_detail",
+                        url=url,
+                        include_replies=should_fetch_replies,
+                        max_replies=args.max_replies,
+                        reply_scroll_count=args.reply_scrolls
+                    )
+
+                    # 成功条件：抓取到了至少一条回复
+                    if detailed_data and detailed_data.get("replies"):
+                        logger.info(f"    [抓取成功] 在第 {attempt + 1} 次尝试中成功抓取到 {len(detailed_data['replies'])} 条回复。")
+                        break # 成功则退出重试循环
+                    
+                    # 失败且未到最后一次尝试，则记录并准备重试
+                    if attempt < max_retries:
+                        logger.warning(f"    [抓取失败] 第 {attempt + 1} 次尝试未能抓取到回复，即将重试...")
+                        await asyncio.sleep(2) # 重试前短暂等待
+                
+                # 在所有尝试结束后，如果依然没有回复，记录最终失败状态
+                if not (detailed_data and detailed_data.get("replies")):
+                     logger.error(f"    [最终失败] 在 {1 + max_retries} 次尝试后，仍未能为URL {url} 抓取到任何回复。")
+
                 all_detailed_tweets.append(detailed_data)
+
             logger.info("--- 所有URL的详细数据抓取完成。 ---")
 
             # =============================================================================
