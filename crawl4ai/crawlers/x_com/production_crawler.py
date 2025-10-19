@@ -204,36 +204,19 @@ async def main(args):
         async with MockBrowserManager() as mock_browser_manager:
             crawler = XProductionCrawler(config=config, browser_manager=mock_browser_manager)
             
-            print("--- Scanning Search Scene for Tweet URLs ---")
+            logger.info("--- Scanning Search Scene for Tweet URLs ---")
             scanner = await crawler.scrape("search", query=args.keyword, scroll_count=args.scan_scrolls)
             
-            # [CHG] Collect all URLs first to get a total count
-            print("--- Collecting all tweet URLs before processing ---")
+            logger.info("--- Collecting all tweet URLs before processing ---")
             all_url_batches = [url_batch async for url_batch in scanner]
             all_urls = [url for batch in all_url_batches for url in batch]
-            total_tweets = len(all_urls)
-            print(f"--- Collected a total of {total_tweets} URLs ---")
+            logger.info(f"--- Collected a total of {len(all_urls)} URLs for potential scraping ---")
 
-            # [ADD] Send the TASK_INIT message to Kafka
-            if args.output_method == 'kafka' and total_tweets > 0:
-                task_control_topic = getattr(config, 'KAFKA_TASK_TOPIC', 'task_control_topic')
-                topic_ready = await ensure_topic_exists(bootstrap_servers=broker_url, topic_name=task_control_topic)
-                if topic_ready:
-                    print(f"--- Sending TASK_INIT to topic '{task_control_topic}' ---")
-                    await send_task_init_message(
-                        producer=kafka_producer,
-                        topic=task_control_topic,
-                        original_task_id=args.original_task_id,
-                        total_tweets=total_tweets
-                    )
-
-            # --- Original processing logic, now using the collected batches ---
-            batch_num = 0
-            should_fetch_replies = args.max_replies > 0
+            # [新增] 收集并过滤所有详细推文数据
+            all_filtered_tweets = []
+            should_fetch_replies = args.max_replies > 0 # 确保此变量已定义
+            logger.info("--- Fetching detailed tweet data and applying reply filter ---")
             for url_batch in all_url_batches:
-                batch_num += 1
-                print(f"\n--- PROCESSING BATCH {batch_num} ({len(url_batch)} URLs) ---")
-                batch_details = []
                 for url in url_batch:
                     detailed_data = await crawler.scrape(
                         "tweet_detail",
@@ -242,18 +225,57 @@ async def main(args):
                         max_replies=args.max_replies,
                         reply_scroll_count=args.reply_scrolls
                     )
-                    if detailed_data:
-                        batch_details.append(detailed_data)
-                
-                if not batch_details: continue
+                    # 过滤条件：如果推文有详细数据且包含回复，则保留
+                    if detailed_data and detailed_data.get("replies") and len(detailed_data["replies"]) > 0:
+                        all_filtered_tweets.append(detailed_data)
+                    else:
+                        logger.info(f"Skipping tweet {url} due to no replies.")
+
+            # [修改] 根据过滤后的推文数量计算 total_tweets
+            total_tweets = len(all_filtered_tweets)
+            logger.info(f"--- After filtering, {total_tweets} tweets remain for processing ---")
+
+            # [新增] 打印有效的推文列表
+            if total_tweets > 0:
+                logger.info("--- 有效推文列表 (仅显示ID和URL) ---")
+                for tweet in all_filtered_tweets:
+                    logger.info(f"  ID: {tweet.get('id', 'N/A')}, URL: {tweet.get('url', 'N/A')}")
+
+            # [修改] 发送 TASK_INIT 消息到 Kafka (total_tweets 现在是过滤后的数量)
+            if args.output_method == 'kafka' and total_tweets > 0:
+                task_control_topic = getattr(config, 'KAFKA_TASK_TOPIC', 'task_control_topic')
+                topic_ready = await ensure_topic_exists(bootstrap_servers=broker_url, topic_name=task_control_topic)
+                if topic_ready:
+                    logger.info(f"--- Sending TASK_INIT to topic '{task_control_topic}' ---")
+                    await send_task_init_message(
+                        producer=kafka_producer,
+                        topic=task_control_topic,
+                        original_task_id=args.original_task_id,
+                        total_tweets=total_tweets
+                    )
+
+            # [修改] 迭代过滤后的推文列表进行发送
+            # 可以根据需要调整批处理大小，这里使用一个示例值
+            batch_size = 10 
+            for i in range(0, total_tweets, batch_size):
+                current_batch_tweets = all_filtered_tweets[i:i + batch_size]
+                batch_num = (i // batch_size) + 1
+                logger.info(f"\n--- PROCESSING BATCH {batch_num} ({len(current_batch_tweets)} filtered tweets) ---")
 
                 if args.output_method == 'kafka':
-                    await send_to_kafka(producer=kafka_producer, topic=kafka_topic, data=batch_details, keyword=args.keyword, original_task_id=args.original_task_id, key_prefix=args.kafka_key_prefix)
+                    await send_to_kafka(
+                        producer=kafka_producer,
+                        topic=kafka_topic,
+                        data=current_batch_tweets, # 发送过滤后的批次
+                        keyword=args.keyword,
+                        original_task_id=args.original_task_id,
+                        key_prefix=args.kafka_key_prefix
+                    )
                 else:
                     batch_file_path = run_output_dir / f"batch_{batch_num}.json"
-                    await save_batch_to_file(data=batch_details, keyword=args.keyword, file_path=batch_file_path)
+                    await save_batch_to_file(data=current_batch_tweets, keyword=args.keyword, file_path=batch_file_path)
 
-            print("\n--- Streaming Workflow Complete ---")
+            logger.info("\n--- Streaming Workflow Complete ---")
 
     finally:
         if kafka_producer:
