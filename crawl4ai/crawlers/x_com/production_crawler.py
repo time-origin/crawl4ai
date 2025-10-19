@@ -248,7 +248,7 @@ async def main(args):
                 if not batch_details: continue
 
                 if args.output_method == 'kafka':
-                    await send_to_kafka(producer=kafka_producer, topic=kafka_topic, data=batch_details, keyword=args.keyword, key_prefix=args.kafka_key_prefix)
+                    await send_to_kafka(producer=kafka_producer, topic=kafka_topic, data=batch_details, keyword=args.keyword, original_task_id=args.original_task_id)
                 else:
                     batch_file_path = run_output_dir / f"batch_{batch_num}.json"
                     await save_batch_to_file(data=batch_details, keyword=args.keyword, file_path=batch_file_path)
@@ -280,7 +280,6 @@ if __name__ == "__main__":
     output_group = parser.add_argument_group('Output Options')
     output_group.add_argument("--output-method", type=str, choices=['file', 'kafka'], default='file', help="Choose output method: file or kafka.")
     output_group.add_argument("--output-prefix", type=str, default="x_com_scrape", help="Prefix for the run-specific output directory.")
-    output_group.add_argument("--kafka-key-prefix", type=str, default="x.com", help="Prefix for the Kafka message key (default: x.com).")
     
     parsed_args = parser.parse_args()
     if not parsed_args.login and not parsed_args.keyword:

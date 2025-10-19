@@ -34,7 +34,7 @@ async def ensure_topic_exists(bootstrap_servers: str, topic_name: str):
         if admin_client:
             await admin_client.close()
 
-async def send_to_kafka(producer: AIOKafkaProducer, topic: str, data: list, keyword: str, key_prefix: str):
+async def send_to_kafka(producer: AIOKafkaProducer, topic: str, data: list, keyword: str, original_task_id: int):
     """
     Sends a batch of scraped data to a Kafka topic, with one message per item,
     using a prefixed ID as the message key.
@@ -44,7 +44,7 @@ async def send_to_kafka(producer: AIOKafkaProducer, topic: str, data: list, keyw
         topic (str): The Kafka topic to send messages to.
         data (list): The list of scraped data dictionaries.
         keyword (str): The search keyword associated with this data.
-        key_prefix (str): The prefix to use for the Kafka message key.
+        original_task_id (int): The ID of the original task.
     """
     if not data:
         return
@@ -53,13 +53,14 @@ async def send_to_kafka(producer: AIOKafkaProducer, topic: str, data: list, keyw
     tasks = []
     for item in data:
         tweet_id = item.get("id", "")
-        # [CHG] Add original_task_id to the main data payload
         message_object = {
+            "original_task_id": original_task_id,
+            "keyword": keyword,
             "tweet_data": item
         }
         message_value = json.dumps(message_object, ensure_ascii=False).encode('utf-8')
         
-        message_key = f"{key_prefix}:{tweet_id}".encode('utf-8')
+        message_key = f"{original_task_id}:{tweet_id}".encode('utf-8')
         
         print(f"Sending message with key: {message_key.decode('utf-8')}")
         tasks.append(producer.send(topic, value=message_value, key=message_key))
